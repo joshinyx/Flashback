@@ -2,7 +2,7 @@
 name = "flashback"
 version = "0.1.0"
 description = "Captura y edición ligera de clips de juego para Windows"
-authors = ["joshinyx"]
+authors = ["Josh Bernal"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -73,7 +73,7 @@ pnpm tauri build  # production build + installer
 
 ## License
 
-MIT
+GPL-3.0
 
 ## About
 
