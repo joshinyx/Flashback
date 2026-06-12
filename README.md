@@ -77,4 +77,4 @@ MIT
 
 ## About
 
-Built by [Josh Bernal](https://joshiny.dev) at [Euxora](https://euxora.net).
+Built by [Josh Bernal](https://joshiny.dev).
