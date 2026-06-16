@@ -33,6 +33,7 @@ fn start_capture(
     target: String,
     fps: u32,
     quality: String,
+    resolution: u32,
 ) -> Result<(), String> {
     use tauri::Manager;
     let dir = app
@@ -41,7 +42,7 @@ fn start_capture(
         .map_err(|e| e.to_string())?
         .join("clips");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    capture::start(target, dir.to_string_lossy().into_owned(), fps, quality)
+    capture::start(target, dir.to_string_lossy().into_owned(), fps, quality, resolution)
 }
 
 #[tauri::command]
@@ -61,6 +62,7 @@ fn start_replay(
     seconds: u32,
     fps: u32,
     quality: String,
+    resolution: u32,
 ) -> Result<(), String> {
     use tauri::Manager;
     let dir = app
@@ -69,7 +71,14 @@ fn start_replay(
         .map_err(|e| e.to_string())?
         .join("clips");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    capture::start_replay(target, dir.to_string_lossy().into_owned(), seconds, fps, quality)
+    capture::start_replay(
+        target,
+        dir.to_string_lossy().into_owned(),
+        seconds,
+        fps,
+        quality,
+        resolution,
+    )
 }
 
 #[tauri::command]

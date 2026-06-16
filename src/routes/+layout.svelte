@@ -16,9 +16,12 @@
     captureConfig,
     setFps,
     setQuality,
+    setResolution,
     qualityLabel,
+    resolutionLabel,
     FPS_OPTIONS,
     QUALITY_OPTIONS,
+    RES_OPTIONS,
     type QualityKey
   } from '$lib/capture-config.svelte';
 
@@ -55,9 +58,7 @@
   let openSeg = $state<string | null>(null);
 
   // Ajustes rápidos de la barra, enlazados a los stores persistidos. Tiempo → buffer del
-  // replay; calidad y FPS → config de captura (los consume el backend). Resolución es
-  // cosmética por ahora (el backend aún no reescala).
-  let resolution = $state('1080p');
+  // replay; calidad, FPS y resolución → config de captura (los consume el backend).
   const secondsLabel = (s: number) => BUFFER_OPTIONS.find((o) => o.seconds === s)?.label ?? `${s}s`;
 
   const segs = $derived<Seg[]>([
@@ -73,14 +74,8 @@
     },
     {
       key: 'resolucion',
-      value: resolution,
-      options: [
-        { val: '480p', raw: '480p' },
-        { val: '720p', label: '720p HD', raw: '720p' },
-        { val: '1080p', label: '1080p Full HD', raw: '1080p' },
-        { val: '1440p', label: '1440p 2K', raw: '1440p' },
-        { val: '2160p', label: '2160p 4K', raw: '2160p' }
-      ]
+      value: resolutionLabel(captureConfig.resolution),
+      options: RES_OPTIONS.map((r) => ({ val: r.label, raw: r.height }))
     },
     {
       key: 'fps',
@@ -153,7 +148,7 @@
     if (key === 'tiempo') setReplaySeconds(opt.raw as number);
     else if (key === 'calidad') setQuality(opt.raw as QualityKey);
     else if (key === 'fps') setFps(opt.raw as number);
-    else if (key === 'resolucion') resolution = opt.raw as string;
+    else if (key === 'resolucion') setResolution(opt.raw as number);
     openSeg = null;
   }
 
@@ -183,7 +178,8 @@
       await invoke('start_capture', {
         target,
         fps: captureConfig.fps,
-        quality: captureConfig.quality
+        quality: captureConfig.quality,
+        resolution: captureConfig.resolution
       });
       setNotice(null);
       recording = true;
@@ -340,15 +336,16 @@
     const seconds = replay.seconds;
     const fps = captureConfig.fps;
     const quality = captureConfig.quality;
+    const resolution = captureConfig.resolution;
     const target = captureTarget;
-    const key = enabled && target ? `${target}|${seconds}|${fps}|${quality}` : 'off';
+    const key = enabled && target ? `${target}|${seconds}|${fps}|${quality}|${resolution}` : 'off';
     if (key === lastReplayKey) return;
     lastReplayKey = key;
     (async () => {
       try {
         await invoke('stop_replay');
         if (key !== 'off') {
-          await invoke('start_replay', { target, seconds, fps, quality });
+          await invoke('start_replay', { target, seconds, fps, quality, resolution });
         }
       } catch (e) {
         setNotice(`No se pudo iniciar el replay: ${e}`);

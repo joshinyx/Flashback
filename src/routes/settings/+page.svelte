@@ -15,8 +15,10 @@
     captureConfig,
     setFps,
     setQuality,
+    setResolution,
     FPS_OPTIONS,
-    QUALITY_OPTIONS
+    QUALITY_OPTIONS,
+    RES_OPTIONS
   } from '$lib/capture-config.svelte';
 
   const icons: { key: AppIcon; label: string }[] = [
@@ -24,7 +26,6 @@
     { key: 'mono', label: 'Monocromo' }
   ];
 
-  let res = $state('1080p');
   let encoder = $state('Automático');
   let autoDelete = $state(true);
 
@@ -102,10 +103,13 @@
     <span class="label panel-title">Captura</span>
 
     <div class="setting">
-      <div class="info"><h3>Resolución</h3><p>Resolución de salida de los clips.</p></div>
+      <div class="info">
+        <h3>Resolución</h3>
+        <p>Alto de salida. Se escala desde la captura nativa, sin superarla.</p>
+      </div>
       <div class="seg">
-        {#each ['720p', '1080p', '1440p', '2160p'] as o (o)}
-          <button class:on={res === o} onclick={() => (res = o)}>{o}</button>
+        {#each RES_OPTIONS as o (o.height)}
+          <button class:on={captureConfig.resolution === o.height} onclick={() => setResolution(o.height)}>{o.label}</button>
         {/each}
       </div>
     </div>

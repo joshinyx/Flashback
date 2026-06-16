@@ -49,6 +49,7 @@ pub fn start(
     _out_dir: String,
     _fps: u32,
     _quality: String,
+    _resolution: u32,
 ) -> Result<(), String> {
     Err("La captura solo está disponible en Windows".into())
 }
@@ -70,6 +71,7 @@ pub fn start_replay(
     _seconds: u32,
     _fps: u32,
     _quality: String,
+    _resolution: u32,
 ) -> Result<(), String> {
     Err("El replay solo está disponible en Windows".into())
 }
@@ -218,6 +220,7 @@ mod win {
         out_dir: String,
         fps: u32,
         quality: String,
+        resolution: u32,
     ) -> std::result::Result<(), String> {
         let mut guard = STATE.lock().unwrap();
         if guard.is_some() {
@@ -237,7 +240,9 @@ mod win {
         let handle = std::thread::Builder::new()
             .name("flashback-capture".into())
             .spawn(move || {
-                capture_thread(target, out_dir, fps, factor, stop_t, stats_t, result_t, ready_tx)
+                capture_thread(
+                    target, out_dir, fps, factor, resolution, stop_t, stats_t, result_t, ready_tx,
+                )
             })
             .map_err(|e| e.to_string())?;
 
@@ -299,6 +304,7 @@ mod win {
         out_dir: String,
         fps: u32,
         factor: f64,
+        resolution: u32,
         stop: Arc<(Mutex<bool>, Condvar)>,
         stats: Arc<Stats>,
         result: Arc<Mutex<Option<String>>>,
@@ -309,7 +315,8 @@ mod win {
         }
 
         let engine = match resolve_target_item(&target).and_then(|item| {
-            build_engine(&stats, item, &out_dir, fps, factor).map_err(|e| format!("{e:?}"))
+            build_engine(&stats, item, &out_dir, fps, factor, resolution)
+                .map_err(|e| format!("{e:?}"))
         }) {
             Ok(e) => {
                 let _ = ready.send(Ok(()));
@@ -371,6 +378,7 @@ mod win {
         out_dir: &str,
         fps: u32,
         factor: f64,
+        resolution: u32,
     ) -> Result<Engine> {
         let (device, d3d_device) = create_device()?;
         // NV12/H.264 exigen dimensiones PARES (ver nota en build_replay): la ventana de un
@@ -380,11 +388,14 @@ mod win {
         size.Height = size.Height.max(2) & !1;
         let width = size.Width as u32;
         let height = size.Height as u32;
-        let bitrate = target_bitrate(width, height, fps, factor);
+        // Se captura a nativo y el encoder escala al objetivo (downscale). El bitrate se
+        // calcula sobre la resolución de salida, no la de captura.
+        let (out_w, out_h) = output_dims(width, height, resolution);
+        let bitrate = target_bitrate(out_w, out_h, fps, factor);
 
         let out_path = format!("{out_dir}\\{}", clip_filename());
         let encoder = Arc::new(Mutex::new(Encoder::new(
-            &device, width, height, fps, bitrate, out_path,
+            &device, width, height, out_w, out_h, fps, bitrate, out_path,
         )?));
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -493,10 +504,16 @@ mod win {
     unsafe impl Send for Encoder {}
 
     impl Encoder {
+        // (in_w,in_h) = resolución de captura nativa que se le entrega; (out_w,out_h) =
+        // resolución del MP4. Si difieren, el SinkWriter intercala un Video Processor que
+        // escala (en GPU, vía el device manager compartido) antes del encoder H.264.
+        #[allow(clippy::too_many_arguments)]
         fn new(
             device: &ID3D11Device,
-            width: u32,
-            height: u32,
+            in_w: u32,
+            in_h: u32,
+            out_w: u32,
+            out_h: u32,
             fps: u32,
             bitrate: u32,
             path: String,
@@ -538,7 +555,7 @@ mod win {
                 out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
                 out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
                 out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-                out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))?;
+                out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(out_w, out_h))?;
                 out_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))?;
                 out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
             }
@@ -549,7 +566,7 @@ mod win {
                 in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
                 in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
                 in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-                in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))?;
+                in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(in_w, in_h))?;
                 in_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))?;
                 in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
                 writer.SetInputMediaType(stream, &in_type, None)?;
@@ -559,10 +576,11 @@ mod win {
 
             // Anillo de texturas propias: WGC reutiliza las suyas en cuanto soltamos
             // el frame, pero el encoder es asíncrono y puede leerlas más tarde; copiar
-            // a una textura nuestra (rotando varias) evita esa carrera.
+            // a una textura nuestra (rotando varias) evita esa carrera. Van a resolución
+            // de captura (in_*): el escalado a out_* lo hace el SinkWriter.
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
+                Width: in_w,
+                Height: in_h,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -738,6 +756,7 @@ mod win {
         seconds: u32,
         fps: u32,
         quality: String,
+        resolution: u32,
     ) -> std::result::Result<(), String> {
         let mut guard = REPLAY_STATE.lock().unwrap();
         if guard.is_some() {
@@ -756,7 +775,11 @@ mod win {
         let buf_t = buffer.clone();
         let handle = std::thread::Builder::new()
             .name("flashback-replay".into())
-            .spawn(move || replay_thread(target, seconds, fps, factor, stop_t, buf_t, stats, ready_tx))
+            .spawn(move || {
+                replay_thread(
+                    target, seconds, fps, factor, resolution, stop_t, buf_t, stats, ready_tx,
+                )
+            })
             .map_err(|e| e.to_string())?;
 
         match ready_rx.recv() {
@@ -840,6 +863,7 @@ mod win {
         seconds: u32,
         fps: u32,
         factor: f64,
+        resolution: u32,
         stop: Arc<AtomicBool>,
         buffer: Arc<Mutex<ReplayBuffer>>,
         stats: Arc<Stats>,
@@ -851,7 +875,8 @@ mod win {
 
         let _ = seconds;
         let pipe = match resolve_target_item(&target).and_then(|item| {
-            build_replay(&buffer, &stats, item, fps, factor).map_err(|e| format!("{e:?}"))
+            build_replay(&buffer, &stats, item, fps, factor, resolution)
+                .map_err(|e| format!("{e:?}"))
         }) {
             Ok(p) => {
                 let _ = ready.send(Ok(()));
@@ -907,6 +932,7 @@ mod win {
         item: GraphicsCaptureItem,
         fps: u32,
         factor: f64,
+        resolution: u32,
     ) -> Result<ReplayPipeline> {
         ensure_mf();
         let (device, d3d_device) = create_device()?;
@@ -918,12 +944,15 @@ mod win {
         size.Height = size.Height.max(2) & !1;
         let width = size.Width as u32;
         let height = size.Height as u32;
-        let bitrate = target_bitrate(width, height, fps, factor);
+        // Captura a nativo (width/height); el conversor escala al objetivo (out_*), que es
+        // la resolución codificada y guardada. El bitrate se calcula sobre la salida.
+        let (out_w, out_h) = output_dims(width, height, resolution);
+        let bitrate = target_bitrate(out_w, out_h, fps, factor);
 
         {
             let mut b = buffer.lock().unwrap();
-            b.width = width;
-            b.height = height;
+            b.width = out_w;
+            b.height = out_h;
             b.fps = fps;
             b.bitrate = bitrate;
         }
@@ -941,20 +970,23 @@ mod win {
 
         // Encoder primero: si no hay H.264 por hardware (o se fuerza), cae a software
         // (MFT síncrono, codifica en CPU). El resto del pipeline se adapta a ese modo.
-        let (encoder, enc_events) = build_encoder(&manager, width, height, fps, bitrate)?;
+        // El encoder trabaja ya en la resolución de salida (out_*).
+        let (encoder, enc_events) = build_encoder(&manager, out_w, out_h, fps, bitrate)?;
         let software = enc_events.is_none();
 
-        // El conversor BGRA→NV12 va en GPU con el encoder por hardware, y en software
-        // (sin device manager, en CPU) cuando el encoder es software.
+        // El conversor BGRA→NV12 escala de captura (width/height) a salida (out_*): va en
+        // GPU con el encoder por hardware, y en software (sin device manager, CPU) si no.
         let converter = build_converter(
             if software { None } else { Some(&manager) },
             width,
             height,
+            out_w,
+            out_h,
             fps,
         )?;
 
-        // Pool de salidas NV12 para el conversor (si no provee él las muestras): GPU en
-        // el camino hardware, memoria de sistema en el software.
+        // Pool de salidas NV12 (a resolución de salida) para el conversor si no las provee
+        // él: GPU en el camino hardware, memoria de sistema en el software.
         let converter_provides = unsafe {
             let info = converter.GetOutputStreamInfo(0)?;
             info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0
@@ -962,9 +994,9 @@ mod win {
         let nv12_pool = if converter_provides {
             Vec::new()
         } else if software {
-            create_nv12_cpu_samples(width, height, 16)?
+            create_nv12_cpu_samples(out_w, out_h, 16)?
         } else {
-            create_nv12_samples(&device, width, height, 16)?
+            create_nv12_samples(&device, out_w, out_h, 16)?
         };
 
         // Readback GPU→CPU solo en software: textura de staging + un handle al contexto
@@ -1062,10 +1094,14 @@ mod win {
         })
     }
 
+    // Conversor de color + escalado: entrada ARGB32 a resolución de captura (in_*),
+    // salida NV12 a resolución objetivo (out_*). Si difieren, el Video Processor escala.
     fn build_converter(
         manager: Option<&IMFDXGIDeviceManager>,
-        width: u32,
-        height: u32,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
         fps: u32,
     ) -> Result<IMFTransform> {
         let converter: IMFTransform =
@@ -1083,7 +1119,7 @@ mod win {
             out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
             out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))?;
+            out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(out_w, out_h))?;
             out_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))?;
             out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
         }
@@ -1093,7 +1129,7 @@ mod win {
             in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
             in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))?;
+            in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(in_w, in_h))?;
             in_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))?;
             in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack2(1, 1))?;
         }
@@ -1773,6 +1809,19 @@ mod win {
 
     fn target_bitrate(width: u32, height: u32, fps: u32, factor: f64) -> u32 {
         (((width as u64 * height as u64 * fps as u64) as f64 * factor) as u32).max(2_000_000)
+    }
+
+    // Dimensiones de salida dadas las de captura y un alto objetivo (0 = nativo). Se
+    // mantiene el aspecto, se redondea a par (NV12/H.264) y NUNCA se hace upscaling:
+    // si el objetivo es >= al nativo se graba a nativo (subir resolución solo infla el
+    // archivo sin añadir detalle). El escalado real lo hace el encoder/conversor.
+    fn output_dims(cap_w: u32, cap_h: u32, target_h: u32) -> (u32, u32) {
+        if target_h == 0 || target_h >= cap_h || cap_h == 0 {
+            return (cap_w, cap_h);
+        }
+        let out_h = (target_h & !1).max(2);
+        let out_w = ((((cap_w as u64 * out_h as u64) / cap_h as u64) as u32) & !1).max(2);
+        (out_w, out_h)
     }
 
     // Intervalo mínimo (en unidades de 100 ns) entre frames codificados para no superar
