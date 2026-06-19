@@ -22,6 +22,8 @@ export type Segment = {
   endMs: number;
 };
 
+const MIN_SEG_MS = 50;
+
 export const editorState = $state<{
   clip: Clip | null;
   videoSrc: string | null;
@@ -68,13 +70,9 @@ function resetEditorState() {
   editorState.exporting = false;
 }
 
-export function inMs(): number {
-  return editorState.segments[0]?.startMs ?? 0;
-}
-export function outMs(): number {
-  return editorState.segments.length > 0
-    ? editorState.segments[editorState.segments.length - 1].endMs
-    : 0;
+// Duración total de salida = suma de las duraciones de los segmentos (sin huecos).
+export function keptMs(): number {
+  return editorState.segments.reduce((a, s) => a + (s.endMs - s.startMs), 0);
 }
 
 export function openEditor(clip: Clip) {
@@ -157,19 +155,19 @@ export function resetTrim() {
   }
 }
 
-export function cutAtPlayhead(playheadMs: number) {
-  if (editorState.durationMs <= 0) return;
-  const idx = editorState.segments.findIndex(s => playheadMs > s.startMs && playheadMs < s.endMs);
-  if (idx < 0) return;
-  const seg = editorState.segments[idx];
-  if (playheadMs - seg.startMs < 100 || seg.endMs - playheadMs < 100) return;
+// Parte un segmento en su posición de origen `srcMs`. Ambas mitades se conservan, contiguas
+// y en el mismo sitio del orden de salida (el corte solo añade un punto de separación).
+export function cutSegmentAt(index: number, srcMs: number) {
+  const seg = editorState.segments[index];
+  if (!seg) return;
+  if (srcMs - seg.startMs < MIN_SEG_MS || seg.endMs - srcMs < MIN_SEG_MS) return;
   const newSegs = [...editorState.segments];
-  newSegs.splice(idx, 1,
-    { startMs: seg.startMs, endMs: playheadMs },
-    { startMs: playheadMs, endMs: seg.endMs },
+  newSegs.splice(index, 1,
+    { startMs: seg.startMs, endMs: srcMs },
+    { startMs: srcMs, endMs: seg.endMs },
   );
   editorState.segments = newSegs;
-  editorState.activeSegment = idx + 1;
+  editorState.activeSegment = index + 1;
   markEdited();
 }
 
@@ -183,32 +181,41 @@ export function removeSegment(index: number) {
   markEdited();
 }
 
-export function moveSegment(fromIndex: number, toIndex: number) {
-  if (fromIndex === toIndex) return;
-  const segs = [...editorState.segments];
-  const [moved] = segs.splice(fromIndex, 1);
-  segs.splice(toIndex, 0, moved);
+export function selectSegment(index: number) {
+  if (index >= 0 && index < editorState.segments.length) {
+    editorState.activeSegment = index;
+  }
+}
+
+// Recorta un borde (in/out) de un segmento. Cada segmento conserva su propio tramo del vídeo
+// original, así que el recorte solo se acota a [0, duración] y a una longitud mínima; los
+// segmentos son independientes entre sí (pueden referirse incluso a tramos solapados).
+export function trimSegment(index: number, edge: 'start' | 'end', newMs: number) {
+  const segs = editorState.segments.map((s) => ({ ...s }));
+  const seg = segs[index];
+  if (!seg) return;
+
+  if (edge === 'start') {
+    seg.startMs = Math.max(0, Math.min(newMs, seg.endMs - MIN_SEG_MS));
+  } else {
+    seg.endMs = Math.min(editorState.durationMs, Math.max(newMs, seg.startMs + MIN_SEG_MS));
+  }
+
+  segs[index] = seg;
   editorState.segments = segs;
-  editorState.activeSegment = toIndex;
   markEdited();
 }
 
-export function moveBoundary(index: number, newMs: number) {
-  const segs = editorState.segments.map((s) => ({ ...s }));
-  if (index < 0 || index >= segs.length - 1) return;
-  const left = segs[index];
-  const right = segs[index + 1];
-  const gap = right.startMs - left.endMs;
-
-  const minEnd = left.startMs + 16;
-  const maxEnd = right.endMs - gap - 16;
-  const newEnd = Math.max(minEnd, Math.min(newMs, maxEnd));
-
-  left.endMs = newEnd;
-  right.startMs = newEnd + gap;
-  segs[index] = left;
-  segs[index + 1] = right;
+// Cambia un segmento de posición en el orden de salida (reordenar bloques). Cada bloque
+// conserva su contenido; el export y el preview reproducen en este orden.
+export function reorderSegment(from: number, to: number) {
+  if (from === to) return;
+  const segs = [...editorState.segments];
+  if (from < 0 || from >= segs.length || to < 0 || to >= segs.length) return;
+  const [moved] = segs.splice(from, 1);
+  segs.splice(to, 0, moved);
   editorState.segments = segs;
+  editorState.activeSegment = to;
   markEdited();
 }
 
