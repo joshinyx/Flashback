@@ -2,7 +2,7 @@
   import Icon from './Icon.svelte';
   import { menu } from '$lib/menu.svelte';
   import { formatDuration, formatRelative, type Clip } from '$lib/clips';
-  import { isFavorite, toggleFavorite } from '$lib/library.svelte';
+  import { isFavorite, toggleFavorite, requestThumb } from '$lib/library.svelte';
   import { openEditor } from '$lib/editor.svelte';
 
   let { clip }: { clip: Clip } = $props();
@@ -10,21 +10,30 @@
   const open = $derived(menu.openId === clip.id);
   const favorite = $derived(isFavorite(clip.id));
 
-  let video = $state<HTMLVideoElement | null>(null);
+  let cardEl = $state<HTMLElement | null>(null);
+  let poster = $state<string | null>(null);
+  let hovering = $state(false);
 
-  // Carátula = primer fotograma del vídeo. Con preload=metadata el frame no siempre
-  // se pinta solo; un seek mínimo lo fuerza a renderizar.
-  function showFirstFrame() {
-    if (video) video.currentTime = 0.05;
-  }
-  function playPreview() {
-    video?.play().catch(() => {});
-  }
-  function stopPreview() {
-    if (!video) return;
-    video.pause();
-    video.currentTime = 0.05;
-  }
+  // Carátula perezosa: la miniatura (un JPEG ligero cacheado por el backend) se pide solo
+  // cuando la tarjeta se acerca al viewport. El <video> no se monta hasta el hover, así que
+  // nunca hay decenas de decodificadores de vídeo activos a la vez.
+  $effect(() => {
+    const el = cardEl;
+    if (!el || poster || !clip.path) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          io.disconnect();
+          requestThumb(clip.path).then((u) => {
+            if (u) poster = u;
+          });
+        }
+      },
+      { rootMargin: '300px' }
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  });
 
   function toggleMenu(e: MouseEvent) {
     e.stopPropagation();
@@ -34,21 +43,23 @@
 
 <svelte:window onclick={() => (menu.openId = null)} />
 
-<article class="card" class:open onmouseenter={playPreview} onmouseleave={stopPreview} onclick={() => openEditor(clip)} onkeydown={() => openEditor(clip)} role="presentation">
+<article class="card" class:open bind:this={cardEl} onmouseenter={() => (hovering = true)} onmouseleave={() => (hovering = false)} onclick={() => openEditor(clip)} onkeydown={() => openEditor(clip)} role="presentation">
   <div class="thumb">
-    {#if clip.previewSrc}
+    {#if poster}
+      <img class="preview" src={poster} alt="" draggable="false" />
+    {:else}
+      <div class="watermark"><Icon name="chevrons" size={150} sw={1.1} /></div>
+    {/if}
+    {#if hovering && clip.previewSrc}
       <video
-        bind:this={video}
         class="preview"
         src={clip.previewSrc}
         muted
         loop
         playsinline
-        preload="metadata"
-        onloadedmetadata={showFirstFrame}
+        autoplay
+        preload="auto"
       ></video>
-    {:else}
-      <div class="watermark"><Icon name="chevrons" size={150} sw={1.1} /></div>
     {/if}
     <div class="scrim"></div>
 

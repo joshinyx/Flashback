@@ -5,6 +5,7 @@ mod capture;
 mod detect;
 mod editor;
 mod library;
+mod thumbnail;
 
 #[tauri::command]
 async fn game_hero(
@@ -136,6 +137,26 @@ fn export_clip(src: String, dst: String, edit: editor::ClipEdit) -> Result<(), S
 }
 
 #[tauri::command]
+fn clip_thumbnail(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("thumbs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    let dst = dir.join(format!("{:016x}.jpg", h.finish()));
+    let ready = dst.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    if !ready {
+        thumbnail::generate(path, dst.to_string_lossy().into_owned(), 1920)?;
+    }
+    Ok(dst.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn list_clips(app: tauri::AppHandle) -> Vec<library::ClipInfo> {
     use tauri::Manager;
     let dir = app
@@ -175,6 +196,7 @@ pub fn run() {
             save_clip_edit,
             keyframe_times,
             clip_fps,
+            clip_thumbnail,
             export_clip,
             start_replay,
             stop_replay,

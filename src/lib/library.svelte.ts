@@ -58,6 +58,46 @@ function toClip(r: RawClip): Clip {
   };
 }
 
+// Miniaturas: el backend extrae un fotograma JPEG cacheado por clip. Se piden de forma
+// perezosa (solo las tarjetas visibles) y con un límite de concurrencia para no saturar la
+// generación al abrir una biblioteca grande. Una vez en disco, las siguientes peticiones
+// devuelven al instante.
+const thumbCache = new Map<string, string>();
+const thumbQueue: (() => void)[] = [];
+let thumbActive = 0;
+const THUMB_CONCURRENCY = 4;
+
+function pumpThumbs() {
+  while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length > 0) {
+    const job = thumbQueue.shift();
+    if (job) {
+      thumbActive++;
+      job();
+    }
+  }
+}
+
+export function requestThumb(path: string): Promise<string | null> {
+  const cached = thumbCache.get(path);
+  if (cached) return Promise.resolve(cached);
+  return new Promise((resolve) => {
+    thumbQueue.push(async () => {
+      try {
+        const p = await invoke<string>('clip_thumbnail', { path });
+        const url = convertFileSrc(p);
+        thumbCache.set(path, url);
+        resolve(url);
+      } catch {
+        resolve(null);
+      } finally {
+        thumbActive--;
+        pumpThumbs();
+      }
+    });
+    pumpThumbs();
+  });
+}
+
 export async function refreshLibrary() {
   try {
     const raw = await invoke<RawClip[]>('list_clips');
