@@ -50,6 +50,7 @@ pub fn start(
     _fps: u32,
     _quality: String,
     _resolution: u32,
+    _bitrate: u32,
     _mic: bool,
     _mic_device: String,
 ) -> Result<(), String> {
@@ -74,6 +75,7 @@ pub fn start_replay(
     _fps: u32,
     _quality: String,
     _resolution: u32,
+    _bitrate: u32,
     _mic: bool,
     _mic_device: String,
 ) -> Result<(), String> {
@@ -226,6 +228,7 @@ mod win {
         fps: u32,
         quality: String,
         resolution: u32,
+        bitrate: u32,
         mic: bool,
         mic_device: String,
     ) -> std::result::Result<(), String> {
@@ -248,8 +251,8 @@ mod win {
             .name("flashback-capture".into())
             .spawn(move || {
                 capture_thread(
-                    target, out_dir, fps, factor, resolution, mic, mic_device, stop_t, stats_t,
-                    result_t, ready_tx,
+                    target, out_dir, fps, factor, resolution, bitrate, mic, mic_device, stop_t,
+                    stats_t, result_t, ready_tx,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -313,6 +316,7 @@ mod win {
         fps: u32,
         factor: f64,
         resolution: u32,
+        bitrate_override: u32,
         mic: bool,
         mic_device: String,
         stop: Arc<(Mutex<bool>, Condvar)>,
@@ -325,8 +329,10 @@ mod win {
         }
 
         let mut engine = match resolve_target_item(&target).and_then(|item| {
-            build_engine(&stats, item, &out_dir, fps, factor, resolution, mic, mic_device)
-                .map_err(|e| format!("{e:?}"))
+            build_engine(
+                &stats, item, &out_dir, fps, factor, resolution, bitrate_override, mic, mic_device,
+            )
+            .map_err(|e| format!("{e:?}"))
         }) {
             Ok(e) => {
                 let _ = ready.send(Ok(()));
@@ -402,6 +408,7 @@ mod win {
         fps: u32,
         factor: f64,
         resolution: u32,
+        bitrate_override: u32,
         mic: bool,
         mic_device: String,
     ) -> Result<Engine> {
@@ -416,7 +423,7 @@ mod win {
         // Se captura a nativo y el encoder escala al objetivo (downscale). El bitrate se
         // calcula sobre la resolución de salida, no la de captura.
         let (out_w, out_h) = output_dims(width, height, resolution);
-        let bitrate = target_bitrate(out_w, out_h, fps, factor);
+        let bitrate = resolve_bitrate(out_w, out_h, fps, factor, bitrate_override);
 
         // Sistema: loopback siempre, en ambos modos de captura (pantalla y aplicación).
         // Micrófono: solo si el toggle está activo y hay dispositivo elegido. Se declara el
@@ -1043,6 +1050,7 @@ mod win {
         fps: u32,
         quality: String,
         resolution: u32,
+        bitrate: u32,
         mic: bool,
         mic_device: String,
     ) -> std::result::Result<(), String> {
@@ -1065,8 +1073,8 @@ mod win {
             .name("flashback-replay".into())
             .spawn(move || {
                 replay_thread(
-                    target, seconds, fps, factor, resolution, mic, mic_device, stop_t, buf_t,
-                    stats, ready_tx,
+                    target, seconds, fps, factor, resolution, bitrate, mic, mic_device, stop_t,
+                    buf_t, stats, ready_tx,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -1229,6 +1237,7 @@ mod win {
         fps: u32,
         factor: f64,
         resolution: u32,
+        bitrate_override: u32,
         mic: bool,
         mic_device: String,
         stop: Arc<AtomicBool>,
@@ -1255,8 +1264,8 @@ mod win {
             }
             let built = resolve_target_item(&target).and_then(|item| {
                 build_replay(
-                    &buffer, &stats, item, fps, factor, resolution, mic, mic_device.clone(),
-                    window_mode,
+                    &buffer, &stats, item, fps, factor, resolution, bitrate_override, mic,
+                    mic_device.clone(), window_mode,
                 )
                 .map_err(|e| format!("{e:?}"))
             });
@@ -1350,6 +1359,9 @@ mod win {
         // Cartel "fuera de foco" (solo modo ventana): se compone una vez al minimizar y se
         // codifica en lugar de los frames congelados. `tex` es su lienzo BGRA de salida.
         card: Option<Card>,
+        // Ventana del juego (modo Aplicación) para consultar el minimizado con IsIconic, sin
+        // recorrer todas las ventanas (EnumWindows) en el hilo de bombeo. 0 = sin ventana.
+        game_hwnd: isize,
     }
     unsafe impl Send for ReplayPipeline {}
 
@@ -1373,6 +1385,7 @@ mod win {
         fps: u32,
         factor: f64,
         resolution: u32,
+        bitrate_override: u32,
         mic: bool,
         mic_device: String,
         window_mode: bool,
@@ -1390,7 +1403,7 @@ mod win {
         // Captura a nativo (width/height); el conversor escala al objetivo (out_*), que es
         // la resolución codificada y guardada. El bitrate se calcula sobre la salida.
         let (out_w, out_h) = output_dims(width, height, resolution);
-        let bitrate = target_bitrate(out_w, out_h, fps, factor);
+        let bitrate = resolve_bitrate(out_w, out_h, fps, factor, bitrate_override);
 
         // Sistema: loopback siempre; micrófono solo si el toggle está activo y hay
         // dispositivo elegido (igual que en build_engine, grabación manual). El ring buffer
@@ -1624,6 +1637,13 @@ mod win {
         } else {
             None
         };
+        // Se resuelve una sola vez aquí (fuera del hilo de bombeo): la ventana principal del
+        // juego es estable mientras exista; minimizar/restaurar no cambia su HWND.
+        let game_hwnd = if window_mode {
+            resolve_game_window().map(|h| h.0 as isize).unwrap_or(0)
+        } else {
+            0
+        };
 
         session.StartCapture()?;
 
@@ -1645,6 +1665,7 @@ mod win {
             audio_tracks,
             mixer,
             card,
+            game_hwnd,
         })
     }
 
@@ -2186,7 +2207,7 @@ mod win {
                 return;
             }
             self.last_min_check = std::time::Instant::now();
-            let now_min = resolve_game_window().is_none();
+            let now_min = window_minimized(pipe.game_hwnd);
             if now_min && !self.minimized {
                 // Transición a minimizado: componer el cartel del último frame real.
                 self.card_ready = false;
@@ -2223,6 +2244,16 @@ mod win {
         fn take_force_key(&mut self) -> bool {
             std::mem::take(&mut self.force_key)
         }
+    }
+
+    // ¿La ventana del juego está minimizada (u oculta)? Consulta barata por HWND, sin recorrer
+    // todas las ventanas; pensada para llamarse desde el hilo de bombeo. 0 = sin ventana.
+    fn window_minimized(hwnd_raw: isize) -> bool {
+        if hwnd_raw == 0 {
+            return true;
+        }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() }
     }
 
     // Pide al encoder que el siguiente frame de salida sea un IDR (best-effort vía ICodecAPI).
@@ -2790,6 +2821,16 @@ mod win {
         (((width as u64 * height as u64 * fps as u64) as f64 * factor) as u32).max(1_000_000)
     }
 
+    // Bitrate final del encoder: el valor personalizado (bps) si el usuario lo fijó
+    // (override > 0), o el automático según resolución/fps/calidad.
+    fn resolve_bitrate(width: u32, height: u32, fps: u32, factor: f64, override_bps: u32) -> u32 {
+        if override_bps > 0 {
+            override_bps
+        } else {
+            target_bitrate(width, height, fps, factor)
+        }
+    }
+
     // Dimensiones de salida dadas las de captura y un alto objetivo (0 = nativo). Se
     // mantiene el aspecto, se redondea a par (NV12/H.264) y NUNCA se hace upscaling:
     // si el objetivo es >= al nativo se graba a nativo (subir resolución solo infla el
@@ -2814,15 +2855,31 @@ mod win {
         }
     }
 
-    // Decide si conservar un frame con timestamp `t` dado el último conservado en
-    // `last` (i64::MIN = ninguno aún). Mantiene la cadencia sin acumular deriva.
-    fn keep_frame(last: &AtomicI64, t: i64, interval: i64) -> bool {
+    // Decide si conservar un frame con timestamp `t`. `next` guarda el próximo instante
+    // objetivo (i64::MIN = aún ninguno) y avanza por `interval` EXACTO, sin reanclarse al `t`
+    // real: así el recuento se mantiene en los FPS pedidos aunque el refresco del monitor no
+    // sea múltiplo del objetivo (p. ej. 60 FPS desde 144 Hz, donde reanclar perdía frames y
+    // daba ~48-50 FPS).
+    fn keep_frame(next: &AtomicI64, t: i64, interval: i64) -> bool {
         if interval <= 0 {
             return true;
         }
-        let prev = last.load(Ordering::Relaxed);
-        if prev == i64::MIN || t - prev >= interval - interval / 10 {
-            last.store(t, Ordering::Relaxed);
+        let prev = next.load(Ordering::Relaxed);
+        if prev == i64::MIN {
+            next.store(t + interval, Ordering::Relaxed);
+            return true;
+        }
+        // Holgura para absorber el jitter del compositor sin descartar un frame válido.
+        if t >= prev - interval / 8 {
+            // El objetivo avanza por un intervalo EXACTO. Solo se realinea ante un hueco grande
+            // (juego congelado/minimizado, ~8+ frames), no por el jitter de entrega de WGC:
+            // realinear por jitter saltaba deadlines y bajaba el recuento (54 en vez de 60).
+            let nd = if t - prev > 8 * interval {
+                t + interval
+            } else {
+                prev + interval
+            };
+            next.store(nd, Ordering::Relaxed);
             true
         } else {
             false

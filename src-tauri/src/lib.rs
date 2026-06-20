@@ -40,6 +40,7 @@ fn start_capture(
     fps: u32,
     quality: String,
     resolution: u32,
+    bitrate: u32,
     mic: bool,
     mic_device: String,
 ) -> Result<(), String> {
@@ -50,7 +51,16 @@ fn start_capture(
         .map_err(|e| e.to_string())?
         .join("clips");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    capture::start(target, dir.to_string_lossy().into_owned(), fps, quality, resolution, mic, mic_device)
+    capture::start(
+        target,
+        dir.to_string_lossy().into_owned(),
+        fps,
+        quality,
+        resolution,
+        bitrate,
+        mic,
+        mic_device,
+    )
 }
 
 #[tauri::command]
@@ -71,6 +81,7 @@ fn start_replay(
     fps: u32,
     quality: String,
     resolution: u32,
+    bitrate: u32,
     mic: bool,
     mic_device: String,
 ) -> Result<(), String> {
@@ -88,6 +99,7 @@ fn start_replay(
         fps,
         quality,
         resolution,
+        bitrate,
         mic,
         mic_device,
     )

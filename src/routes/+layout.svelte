@@ -18,11 +18,14 @@
     setFps,
     setQuality,
     setResolution,
+    setBitrate,
     qualityLabel,
     resolutionLabel,
+    bitrateLabel,
     FPS_OPTIONS,
     QUALITY_OPTIONS,
     RES_OPTIONS,
+    BITRATE_OPTIONS,
     type QualityKey
   } from '$lib/capture-config.svelte';
 
@@ -57,6 +60,8 @@
   let micInput = $state('');
   let micDDOpen = $state(false);
   let openSeg = $state<string | null>(null);
+  // Última calidad no personalizada: al pulsar "Auto" en el seg de bitrate se vuelve a ella.
+  let prevQuality: QualityKey = captureConfig.quality === 'custom' ? 'high' : captureConfig.quality;
 
   // Ajustes rápidos de la barra, enlazados a los stores persistidos. Tiempo → buffer del
   // replay; calidad, FPS y resolución → config de captura (los consume el backend).
@@ -68,11 +73,22 @@
       value: secondsLabel(replay.seconds),
       options: BUFFER_OPTIONS.map((o) => ({ val: o.label, raw: o.seconds }))
     },
-    {
-      key: 'calidad',
-      value: qualityLabel(captureConfig.quality),
-      options: QUALITY_OPTIONS.map((q) => ({ val: q.label, raw: q.key }))
-    },
+    // Calidad y bitrate comparten posición: elegir "Personalizado" convierte este seg en el
+    // de bitrate (que incluye "Auto" para volver a las calidades Bajo/Medio/Alto/Ultra).
+    captureConfig.quality === 'custom'
+      ? {
+          key: 'bitrate',
+          value: bitrateLabel(captureConfig.bitrate),
+          options: [
+            { val: 'Auto', raw: 'auto' },
+            ...BITRATE_OPTIONS.map((b) => ({ val: b.label, raw: b.mbps }))
+          ]
+        }
+      : {
+          key: 'calidad',
+          value: qualityLabel(captureConfig.quality),
+          options: QUALITY_OPTIONS.map((q) => ({ val: q.label, raw: q.key }))
+        },
     {
       key: 'resolucion',
       value: resolutionLabel(captureConfig.resolution),
@@ -147,9 +163,17 @@
   function pickSeg(e: MouseEvent, key: string, opt: SegOpt) {
     e.stopPropagation();
     if (key === 'tiempo') setReplaySeconds(opt.raw as number);
-    else if (key === 'calidad') setQuality(opt.raw as QualityKey);
-    else if (key === 'fps') setFps(opt.raw as number);
+    else if (key === 'calidad') {
+      const q = opt.raw as QualityKey;
+      if (q !== 'custom') prevQuality = q;
+      setQuality(q);
+    } else if (key === 'fps') setFps(opt.raw as number);
     else if (key === 'resolucion') setResolution(opt.raw as number);
+    else if (key === 'bitrate') {
+      // "Auto" sale del modo personalizado y vuelve a la última calidad usada.
+      if (opt.raw === 'auto') setQuality(prevQuality);
+      else setBitrate(opt.raw as number);
+    }
     openSeg = null;
   }
 
@@ -181,6 +205,7 @@
         fps: captureConfig.fps,
         quality: captureConfig.quality,
         resolution: captureConfig.resolution,
+        bitrate: captureConfig.quality === 'custom' ? captureConfig.bitrate * 1_000_000 : 0,
         mic: micOn,
         micDevice: micInput
       });
@@ -341,17 +366,18 @@
     const fps = captureConfig.fps;
     const quality = captureConfig.quality;
     const resolution = captureConfig.resolution;
+    const bitrate = quality === 'custom' ? captureConfig.bitrate * 1_000_000 : 0;
     const target = captureTarget;
     const mic = micOn;
     const micDevice = micInput;
-    const key = enabled && target ? `${target}|${seconds}|${fps}|${quality}|${resolution}|${mic}|${micDevice}` : 'off';
+    const key = enabled && target ? `${target}|${seconds}|${fps}|${quality}|${resolution}|${bitrate}|${mic}|${micDevice}` : 'off';
     if (key === lastReplayKey) return;
     lastReplayKey = key;
     (async () => {
       try {
         await invoke('stop_replay');
         if (key !== 'off') {
-          await invoke('start_replay', { target, seconds, fps, quality, resolution, mic, micDevice });
+          await invoke('start_replay', { target, seconds, fps, quality, resolution, bitrate, mic, micDevice });
         }
       } catch (e) {
         setNotice(`No se pudo iniciar el replay: ${e}`);
