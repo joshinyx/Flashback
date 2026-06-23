@@ -165,9 +165,21 @@ fn clip_thumbnail(app: tauri::AppHandle, path: String) -> Result<String, String>
     let dst = dir.join(format!("{:016x}.jpg", h.finish()));
     let ready = dst.metadata().map(|m| m.len() > 0).unwrap_or(false);
     if !ready {
-        thumbnail::generate(path, dst.to_string_lossy().into_owned(), 1920)?;
+        // max_w = 0: miniatura a la resolución nativa del clip (la carátula se muestra a la
+        // máxima calidad y empareja con el vídeo en el hover).
+        thumbnail::generate(path, dst.to_string_lossy().into_owned(), 0)?;
     }
     Ok(dst.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn rename_clip(path: String, new_name: String) -> Result<String, String> {
+    library::rename_clip(&path, &new_name)
+}
+
+#[tauri::command]
+fn delete_clip(path: String) -> Result<(), String> {
+    library::delete_clip(&path)
 }
 
 #[tauri::command]
@@ -212,6 +224,8 @@ pub fn run() {
             clip_fps,
             clip_thumbnail,
             export_clip,
+            rename_clip,
+            delete_clip,
             start_replay,
             stop_replay,
             save_replay,

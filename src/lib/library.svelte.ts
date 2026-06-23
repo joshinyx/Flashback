@@ -34,8 +34,7 @@ export function isFavorite(id: string): boolean {
   return favorites.ids.includes(id);
 }
 
-export function toggleFavorite(id: string) {
-  favorites.ids = isFavorite(id) ? favorites.ids.filter((x) => x !== id) : [...favorites.ids, id];
+function persistFavs() {
   if (typeof localStorage !== 'undefined') {
     try {
       localStorage.setItem(FAV_KEY, JSON.stringify(favorites.ids));
@@ -43,6 +42,25 @@ export function toggleFavorite(id: string) {
       // sin persistencia disponible
     }
   }
+}
+
+export function toggleFavorite(id: string) {
+  favorites.ids = isFavorite(id) ? favorites.ids.filter((x) => x !== id) : [...favorites.ids, id];
+  persistFavs();
+}
+
+// Al renombrar/borrar un clip su id (= nombre del archivo) cambia o desaparece; se actualiza
+// la lista de favoritos para que el estado siga al clip.
+export function renameFavorite(oldId: string, newId: string) {
+  if (!isFavorite(oldId)) return;
+  favorites.ids = [...favorites.ids.filter((x) => x !== oldId), newId];
+  persistFavs();
+}
+
+export function removeFavorite(id: string) {
+  if (!isFavorite(id)) return;
+  favorites.ids = favorites.ids.filter((x) => x !== id);
+  persistFavs();
 }
 
 function toClip(r: RawClip): Clip {

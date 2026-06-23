@@ -300,7 +300,7 @@
   }
   .switch.on .knob {
     transform: translateX(19px);
-    background: var(--accent);
+    background: var(--on-accent);
   }
 
   .btn {

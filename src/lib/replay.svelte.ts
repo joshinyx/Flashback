@@ -2,10 +2,13 @@ const ENABLED_KEY = 'flashback.replay.enabled';
 const SECONDS_KEY = 'flashback.replay.seconds';
 
 export const BUFFER_OPTIONS: { label: string; seconds: number }[] = [
-  { label: '30 s', seconds: 30 },
-  { label: '1 min', seconds: 60 },
-  { label: '3 min', seconds: 180 },
-  { label: '5 min', seconds: 300 }
+  { label: '00:30', seconds: 30 },
+  { label: '01:00', seconds: 60 },
+  { label: '02:00', seconds: 120 },
+  { label: '03:00', seconds: 180 },
+  { label: '05:00', seconds: 300 },
+  { label: '10:00', seconds: 600 },
+  { label: '15:00', seconds: 900 }
 ];
 
 function loadEnabled(): boolean {

@@ -183,9 +183,10 @@ mod win {
         Ok(())
     }
 
-    // Escala manteniendo la relación de aspecto, sin superar `max_w`, con lados pares.
+    // Escala manteniendo la relación de aspecto, sin superar `max_w` (0 = resolución nativa,
+    // sin límite), con lados pares.
     fn target_size(sw: u32, sh: u32, max_w: u32) -> (u32, u32) {
-        let w = sw.min(max_w);
+        let w = if max_w == 0 { sw } else { sw.min(max_w) };
         let h = ((w as u64 * sh as u64) / sw as u64) as u32;
         (w & !1, h.max(2) & !1)
     }

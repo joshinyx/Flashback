@@ -1,34 +1,22 @@
 const FPS_KEY = 'flashback.capture.fps';
 const QUALITY_KEY = 'flashback.capture.quality';
 const RESOLUTION_KEY = 'flashback.capture.resolution';
-const BITRATE_KEY = 'flashback.capture.bitrate';
 const MIC_KEY = 'flashback.capture.mic';
 const MIC_DEVICE_KEY = 'flashback.capture.micDevice';
 
-export const FPS_OPTIONS = [20, 30, 60];
+export const FPS_OPTIONS = [20, 30, 60, 120, 240];
 
-// Bitrate manual en Mbps. Solo se usa cuando la calidad es "Personalizado": sobreescribe el
-// cálculo automático (p. ej. 100M en 1080p, por encima de Ultra). En el resto de calidades el
-// bitrate lo calcula el backend según calidad/resolución/fps.
-export const BITRATE_OPTIONS: { mbps: number; label: string }[] = [
-  { mbps: 5, label: '5M' },
-  { mbps: 10, label: '10M' },
-  { mbps: 15, label: '15M' },
-  { mbps: 20, label: '20M' },
-  { mbps: 30, label: '30M' },
-  { mbps: 50, label: '50M' },
-  { mbps: 75, label: '75M' },
-  { mbps: 100, label: '100M' }
-];
+export type QualityKey = 'low' | 'normal' | 'high' | 'veryhigh' | 'ultra';
 
-export type QualityKey = 'low' | 'normal' | 'high' | 'ultra' | 'custom';
-
+// Escalera de calidad alineada con SteelSeries Moments (1080p60): Bajo ≈ 19, Medio ≈ 34,
+// Alto ≈ 50, Muy alta ≈ 90, Ultra ≈ 130 Mbps. El bitrate real lo calcula el backend
+// (ancho·alto·fps·factor), así escala con la resolución y los fps.
 export const QUALITY_OPTIONS: { key: QualityKey; label: string }[] = [
   { key: 'low', label: 'Bajo' },
   { key: 'normal', label: 'Medio' },
   { key: 'high', label: 'Alto' },
-  { key: 'ultra', label: 'Ultra' },
-  { key: 'custom', label: 'Personalizado' }
+  { key: 'veryhigh', label: 'Muy alta' },
+  { key: 'ultra', label: 'Ultra' }
 ];
 
 // Alto objetivo del clip. El backend captura a nativo y escala a este alto (manteniendo
@@ -59,12 +47,6 @@ function loadResolution(): number {
   return RES_OPTIONS.some((o) => o.height === n) ? n : 1080;
 }
 
-function loadBitrate(): number {
-  if (typeof localStorage === 'undefined') return 50;
-  const n = Number(localStorage.getItem(BITRATE_KEY));
-  return BITRATE_OPTIONS.some((o) => o.mbps === n) ? n : 50;
-}
-
 function loadMic(): boolean {
   if (typeof localStorage === 'undefined') return false;
   return localStorage.getItem(MIC_KEY) === '1';
@@ -81,14 +63,12 @@ export const captureConfig = $state<{
   fps: number;
   quality: QualityKey;
   resolution: number;
-  bitrate: number;
   mic: boolean;
   micDevice: string;
 }>({
   fps: loadFps(),
   quality: loadQuality(),
   resolution: loadResolution(),
-  bitrate: loadBitrate(),
   mic: loadMic(),
   micDevice: loadMicDevice()
 });
@@ -101,8 +81,41 @@ export function resolutionLabel(height: number): string {
   return RES_OPTIONS.find((o) => o.height === height)?.label ?? `${height}p`;
 }
 
-export function bitrateLabel(mbps: number): string {
-  return BITRATE_OPTIONS.find((o) => o.mbps === mbps)?.label ?? `${mbps}M`;
+// Bits por píxel y frame de cada calidad. Debe coincidir con bitrate_factor() del backend.
+export function qualityFactor(quality: QualityKey): number {
+  switch (quality) {
+    case 'low':
+      return 0.15;
+    case 'normal':
+      return 0.27;
+    case 'veryhigh':
+      return 0.72;
+    case 'ultra':
+      return 1.05;
+    default:
+      return 0.4; // high (Alto)
+  }
+}
+
+// Estima el bitrate de vídeo (bps) replicando la fórmula del backend
+// (ancho·alto·fps·factor, piso 1 Mbps). Asume 16:9 sobre el alto objetivo: suficiente
+// para una estimación de tamaño en la barra sin conocer el aspecto real de la pantalla.
+function videoBitrate(quality: QualityKey, height: number, fps: number): number {
+  const width = Math.round((height * 16) / 9 / 2) * 2;
+  return Math.max(width * height * fps * qualityFactor(quality), 1_000_000);
+}
+
+// Tamaño aproximado de un clip de `seconds` con los ajustes dados (vídeo + una pista de audio).
+export function estimatedClipSize(
+  seconds: number,
+  quality: QualityKey,
+  height: number,
+  fps: number
+): string {
+  const bps = videoBitrate(quality, height, fps) + 128_000;
+  const mb = ((bps / 8) * seconds) / 1_000_000;
+  if (mb >= 1000) return `${(mb / 1000).toFixed(mb >= 10_000 ? 0 : 1)} GB`;
+  return `${Math.round(mb)} MB`;
 }
 
 export function setFps(fps: number) {
@@ -118,11 +131,6 @@ export function setQuality(quality: QualityKey) {
 export function setResolution(height: number) {
   captureConfig.resolution = height;
   persist(RESOLUTION_KEY, String(height));
-}
-
-export function setBitrate(mbps: number) {
-  captureConfig.bitrate = mbps;
-  persist(BITRATE_KEY, String(mbps));
 }
 
 export function setMic(enabled: boolean) {

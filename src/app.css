@@ -13,11 +13,11 @@
   --text-2: #97979c;
   --text-3: #6f6f76;
 
-  --accent: #3f6df5;
-  --accent-soft: #5d83f8;
-  --accent-deep: #2a4cc0;
-  --accent-glow: rgba(63, 109, 245, 0.32);
-  --on-accent: #ffffff;
+  --accent: #f0f2f7;
+  --accent-soft: #ffffff;
+  --accent-deep: #e4e7ee;
+  --accent-glow: rgba(240, 242, 247, 0.16);
+  --on-accent: #15151a;
 
   --bright: #f0f2f7;
 

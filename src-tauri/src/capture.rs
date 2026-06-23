@@ -465,6 +465,7 @@ mod win {
         // Sin el borde de captura de WGC (si el SO lo permite): no queremos esa línea de
         // color alrededor de la ventana/pantalla dentro del clip grabado.
         let _ = session.SetIsBorderRequired(false);
+        set_capture_rate(&session, fps);
 
         // El handler corre en el pool de hilos del sistema (frame pool free-threaded):
         // recoge la textura del frame y la empuja al encoder por hardware. La textura
@@ -1511,6 +1512,7 @@ mod win {
         )?;
         let session = frame_pool.CreateCaptureSession(&item)?;
         let _ = session.SetIsBorderRequired(false);
+        set_capture_rate(&session, fps);
 
         // Límite de FPS: descartar frames antes de la copia GPU y del canal para no
         // codificar de más (clave para los perfiles ligeros tipo 480p/20 FPS).
@@ -1953,6 +1955,9 @@ mod win {
         let mut need: i32 = 0;
         let mut base: Option<i64> = None;
         let mut seq_grabbed = false;
+        // Tope de la cola pre-encoder: si el encoder no sostiene la tasa (p. ej. 240 fps) se
+        // descartan frames en vez de acumular memoria/latencia. A tasas sostenibles no se llena.
+        const MAX_PENDING: usize = 16;
         let mut pending: VecDeque<(SendTex, i64)> = VecDeque::new();
         // Timestamps de entrada en el orden en que se alimentan al encoder. Como el
         // encoder va en Baseline (sin reordenar), la N-ésima salida corresponde al
@@ -1969,6 +1974,9 @@ mod win {
                     foc.note_real_frame(&f.0 .0, f.1);
                     if !foc.minimized {
                         pending.push_back(f);
+                        if pending.len() > MAX_PENDING {
+                            pending.pop_front();
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2055,9 +2063,13 @@ mod win {
                     pts_fifo.push_back(rebased);
                     need -= 1;
                 } else {
-                    // No se pudo alimentar (encoder ocupado). Conservamos el crédito de
-                    // `need` y reintentamos en la próxima vuelta; cortamos aquí para no
-                    // martillear al encoder con el resto de frames pendientes.
+                    // No se pudo alimentar (encoder ocupado): devolvemos el frame al frente
+                    // para reintentarlo cuando el encoder libere salida, en vez de perderlo
+                    // (lo que bajaba el recuento de FPS a bitrates altos). Si la cola ya está
+                    // llena, el encoder no sostiene la tasa y se descarta (inevitable a 240).
+                    if pending.len() < MAX_PENDING {
+                        pending.push_front((tex, time));
+                    }
                     break;
                 }
             }
@@ -2798,16 +2810,16 @@ mod win {
         ((high as u64) << 32) | low as u64
     }
 
-    // Bits por píxel y frame según calidad: a más factor, más bitrate (y tamaño).
-    // Bits por píxel por frame (bitrate = ancho·alto·fps·factor). Calibrado por encima de las
-    // recomendaciones de subida de YouTube (~0.10-0.12 bpp en alta) para no sacrificar imagen:
-    // High supera esa referencia y Ultra es prácticamente transparente (2160p60 ≈ 100 Mbps).
+    // Bits por píxel y frame según calidad (bitrate = ancho·alto·fps·factor). Calibrado con
+    // SteelSeries Moments a 1080p60: Bajo ≈ 19, Medio ≈ 34, Alto ≈ 50, Muy alta ≈ 90,
+    // Ultra ≈ 130 Mbps. Debe coincidir con qualityFactor() del frontend (estimación de tamaño).
     fn bitrate_factor(quality: &str) -> f64 {
         match quality {
-            "low" => 0.04,
-            "normal" => 0.08,
-            "ultra" => 0.20,
-            _ => 0.14, // "high" (por defecto)
+            "low" => 0.15,
+            "normal" => 0.27,
+            "veryhigh" => 0.72,
+            "ultra" => 1.05,
+            _ => 0.40, // "high" (Alto, por defecto)
         }
     }
 
@@ -2842,6 +2854,15 @@ mod win {
         let out_h = (target_h & !1).max(2);
         let out_w = ((((cap_w as u64 * out_h as u64) / cap_h as u64) as u32) & !1).max(2);
         (out_w, out_h)
+    }
+
+    // WGC limita FrameArrived a ~60 Hz por defecto mediante MinUpdateInterval. Lo bajamos a la
+    // mitad del periodo objetivo para que entregue candidatos de sobra y el limitador clave los
+    // FPS exactos (y permita >60 en monitores de alta tasa). En Windows 10 la propiedad no
+    // existe: la llamada falla sin efecto y se mantiene el tope por defecto.
+    fn set_capture_rate(session: &GraphicsCaptureSession, fps: u32) {
+        let dur = (fps_interval(fps) / 2).max(20_000);
+        let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: dur });
     }
 
     // Intervalo mínimo (en unidades de 100 ns) entre frames codificados para no superar

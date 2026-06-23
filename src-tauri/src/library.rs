@@ -68,6 +68,89 @@ pub fn list_clips(dir: PathBuf) -> Vec<ClipInfo> {
     out
 }
 
+// Sidecars que acompañan a cada MP4 (metadato de fuente y edición no destructiva). Renombrar
+// o borrar un clip debe arrastrarlos para no dejar huérfanos.
+const SIDECARS: [&str; 2] = ["clip.json", "edit.json"];
+
+// Renombra el clip (y sus sidecars). Valida el nombre y evita pisar otro clip. Devuelve la
+// nueva ruta del MP4.
+pub fn rename_clip(path: &str, new_name: &str) -> Result<String, String> {
+    let p = Path::new(path);
+    let parent = p.parent().ok_or("Ruta inválida")?;
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err("El nombre no puede estar vacío".into());
+    }
+    if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Err("El nombre contiene caracteres no válidos".into());
+    }
+    let new_mp4 = parent.join(format!("{name}.mp4"));
+    if new_mp4 == p {
+        return Ok(path.to_string());
+    }
+    if new_mp4.exists() {
+        return Err("Ya existe un clip con ese nombre".into());
+    }
+    std::fs::rename(p, &new_mp4).map_err(|e| e.to_string())?;
+    for ext in SIDECARS {
+        let from = p.with_extension(ext);
+        if from.exists() {
+            let _ = std::fs::rename(&from, new_mp4.with_extension(ext));
+        }
+    }
+    Ok(new_mp4.to_string_lossy().into_owned())
+}
+
+// Envía el clip y sus sidecars a la papelera (recuperable). El borrado es la única operación
+// destructiva de la app, así que se usa la papelera del sistema en vez de un borrado directo.
+pub fn delete_clip(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    let mut files = vec![p.to_path_buf()];
+    for ext in SIDECARS {
+        let s = p.with_extension(ext);
+        if s.exists() {
+            files.push(s);
+        }
+    }
+    recycle(&files)
+}
+
+#[cfg(windows)]
+fn recycle(paths: &[PathBuf]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
+        SHFILEOPSTRUCTW,
+    };
+    // pFrom es una lista de rutas separadas por NUL y terminada en doble NUL.
+    let mut from: Vec<u16> = Vec::new();
+    for p in paths {
+        from.extend(p.as_os_str().encode_wide());
+        from.push(0);
+    }
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE as u32,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        ..Default::default()
+    };
+    let rc = unsafe { SHFileOperationW(&mut op) };
+    if rc != 0 {
+        return Err(format!("No se pudo enviar a la papelera (código {rc})"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn recycle(paths: &[PathBuf]) -> Result<(), String> {
+    for p in paths {
+        std::fs::remove_file(p).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn read_u32(f: &mut File) -> Option<u32> {
     let mut b = [0u8; 4];
     f.read_exact(&mut b).ok()?;
