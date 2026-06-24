@@ -193,9 +193,77 @@ fn list_clips(app: tauri::AppHandle) -> Vec<library::ClipInfo> {
     library::list_clips(dir)
 }
 
+#[derive(Clone, serde::Serialize)]
+struct ToastPayload {
+    text: String,
+    kind: String,
+}
+
+// Muestra el toast en la ventana overlay (transparente, siempre encima, click-through). La
+// ventana permanece oculta entre avisos (una ventana transparente vacía se compone gris en
+// Windows) y se muestra solo durante el toast. Es no-activable (set_focusable(false) en el
+// setup), así que show() no le roba el foco al juego. Se reposiciona arriba-derecha del
+// monitor primario por si cambió la resolución/escala. El overlay la oculta al terminar.
+#[tauri::command]
+fn toast(app: tauri::AppHandle, text: String, kind: String) -> Result<(), String> {
+    use tauri::{Emitter, Manager};
+    let w = app
+        .get_webview_window("overlay")
+        .ok_or("overlay window missing")?;
+    if let Ok(Some(mon)) = w.primary_monitor() {
+        let mpos = mon.position();
+        let msize = mon.size();
+        let scale = mon.scale_factor();
+        let margin = (16.0 * scale) as i32;
+        if let Ok(size) = w.outer_size() {
+            // Lengüeta anclada al borde derecho: pegada a la derecha (x sin margen), con un
+            // pequeño margen arriba.
+            let x = mpos.x + msize.width as i32 - size.width as i32;
+            let y = mpos.y + margin;
+            let _ = w.set_position(tauri::PhysicalPosition { x, y });
+        }
+    }
+    // Contenido primero (el webview oculto sigue ejecutando JS), luego mostrar: así nunca se
+    // ve la ventana transparente vacía (gris) antes de pintar el toast.
+    app.emit_to("overlay", "show-toast", ToastPayload { text, kind })
+        .map_err(|e| e.to_string())?;
+    let _ = w.show();
+    // Reafirmar topmost en cada toast: así se coloca por encima de juegos en ventana o
+    // borderless. No activa la ventana (es no-focusable), así que no le roba el foco.
+    let _ = w.set_always_on_top(true);
+    Ok(())
+}
+
+#[tauri::command]
+fn dismiss_toast(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.hide();
+    }
+}
+
+// Trae la ventana principal al frente (desde la bandeja o el atajo de abrir).
+fn show_main(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // Instancia única: si se intenta abrir una segunda, se enfoca la existente y la nueva
+    // sale. Debe ir como primer plugin para cortar antes de crear ventanas.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }));
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             use tauri::Manager;
@@ -205,6 +273,50 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_min_size(Some(tauri::LogicalSize { width: 1200.0, height: 675.0 }));
                 let _ = w.set_size(tauri::LogicalSize { width: 1200.0, height: 675.0 });
+            }
+            if let Some(o) = app.get_webview_window("overlay") {
+                let _ = o.set_ignore_cursor_events(true);
+                // No-activable: al mostrarse durante un toast no debe robar el foco al juego.
+                let _ = o.set_focusable(false);
+            }
+
+            // Bandeja del sistema. Doble clic izquierdo abre la app; clic derecho abre el
+            // menú con "Abrir Flashback" y "Cerrar". El replay sigue corriendo aunque la
+            // ventana esté oculta (vive en hilos de Rust, no en la UI).
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+            let open_i = MenuItem::with_id(app, "open", "Abrir Flashback", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Cerrar", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_i, &quit_i])?;
+            let mut tray = TrayIconBuilder::with_id("flashback")
+                .tooltip("Flashback")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = event {
+                        show_main(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
+            // Cerrar la ventana (botón X) no termina la app: la oculta a la bandeja. Salir de
+            // verdad es solo desde el menú de la bandeja ("Cerrar" → app.exit).
+            if let Some(main) = app.get_webview_window("main") {
+                let main_c = main.clone();
+                main.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = main_c.hide();
+                    }
+                });
             }
             Ok(())
         })
@@ -229,7 +341,9 @@ pub fn run() {
             start_replay,
             stop_replay,
             save_replay,
-            replay_active
+            replay_active,
+            toast,
+            dismiss_toast
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

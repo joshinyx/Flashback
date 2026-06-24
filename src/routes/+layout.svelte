@@ -11,6 +11,7 @@
   import { hotkeys, capture, labelFor } from '$lib/hotkeys.svelte';
   import { refreshLibrary } from '$lib/library.svelte';
   import { replay, setReplaySeconds, BUFFER_OPTIONS } from '$lib/replay.svelte';
+  import { playReplaySound } from '$lib/replay-sound.svelte';
   import Editor from '$lib/components/Editor.svelte';
   import { editorState, closeEditor } from '$lib/editor.svelte';
   import {
@@ -122,12 +123,11 @@
     )
   );
 
-  let notice = $state<string | null>(null);
-  let noticeTimer: ReturnType<typeof setTimeout> | null = null;
-  function setNotice(msg: string | null) {
-    notice = msg;
-    if (noticeTimer) clearTimeout(noticeTimer);
-    if (msg) noticeTimer = setTimeout(() => (notice = null), 6000);
+  // El feedback se muestra como toast en una ventana overlay (transparente, siempre
+  // encima, click-through) para que sea visible también sobre el juego en modo Aplicación.
+  type ToastKind = 'info' | 'ready' | 'saved' | 'error';
+  function toast(text: string, kind: ToastKind = 'info') {
+    invoke('toast', { text, kind }).catch(() => {});
   }
 
   const activeMonitor = $derived(monitors.find((m) => m.id === selectedMonitor) ?? null);
@@ -202,10 +202,9 @@
     if (recording) return;
     const target = captureTarget;
     if (!target) {
-      setNotice('Selecciona una pantalla para grabar, o abre un juego para el modo Aplicación.');
+      toast('Selecciona una pantalla para grabar, o abre un juego para el modo Aplicación.');
       return;
     }
-    setNotice('Iniciando grabación…');
     try {
       await invoke('start_capture', {
         target,
@@ -216,10 +215,10 @@
         mic: micOn,
         micDevice: micInput
       });
-      setNotice(null);
       recording = true;
+      toast('Grabando', 'ready');
     } catch (e) {
-      setNotice(`No se pudo iniciar la grabación: ${e}`);
+      toast(`No se pudo iniciar la grabación: ${e}`, 'error');
       console.error('start_capture', e);
     }
   }
@@ -229,10 +228,14 @@
     recording = false;
     try {
       const path = await invoke<string | null>('stop_capture');
-      setNotice(path ? `Clip guardado: ${path}` : 'Grabación detenida (no se guardó archivo).');
-      if (path) await refreshLibrary();
+      if (path) {
+        toast('Clip guardado', 'saved');
+        await refreshLibrary();
+      } else {
+        toast('Grabación detenida', 'info');
+      }
     } catch (e) {
-      setNotice(`Error al detener la grabación: ${e}`);
+      toast(`Error al detener la grabación: ${e}`, 'error');
       console.error('stop_capture', e);
     }
   }
@@ -248,25 +251,25 @@
 
   async function saveReplay() {
     if (!replay.enabled) {
-      setNotice('Activa "Replay en segundo plano" en Ajustes para guardar.');
+      toast('Activa "Replay en segundo plano" en Ajustes para guardar.');
       return;
     }
     if (!captureTarget) {
-      setNotice('Sin objetivo: selecciona una pantalla o abre un juego para que el replay grabe.');
+      toast('Sin objetivo: selecciona una pantalla o abre un juego para que el replay grabe.');
       return;
     }
-    setNotice('Guardando replay…');
     try {
       const source = game || activeMonitor?.label || 'Pantalla';
       const path = await invoke<string | null>('save_replay', { source });
       if (path) {
-        setNotice(`Replay guardado: ${path}`);
+        playReplaySound();
+        toast('Clip guardado', 'saved');
         await refreshLibrary();
       } else {
-        setNotice('No se pudo guardar el replay (el buffer aún no tiene un keyframe).');
+        toast('No se pudo guardar el replay (el buffer aún no tiene un keyframe).');
       }
     } catch (e) {
-      setNotice(`Error al guardar el replay: ${e}`);
+      toast(`Error al guardar el replay: ${e}`, 'error');
       console.error('save_replay', e);
     }
   }
@@ -354,7 +357,7 @@
       } catch (e) {
         if (!cancelled) {
           console.error('register hotkeys', e);
-          setNotice(`No se pudieron registrar los atajos: ${e}`);
+          toast(`No se pudieron registrar los atajos: ${e}`, 'error');
         }
       }
     })();
@@ -379,15 +382,19 @@
     const micDevice = micInput;
     const key = enabled && target ? `${target}|${seconds}|${fps}|${quality}|${resolution}|${bitrate}|${mic}|${micDevice}` : 'off';
     if (key === lastReplayKey) return;
+    // Solo avisamos "Listo para clipear" al armar el replay desde apagado, no en cada
+    // reconfiguración (cambiar calidad/fps reinicia el replay pero no es un evento nuevo).
+    const wasOff = lastReplayKey === '' || lastReplayKey === 'off';
     lastReplayKey = key;
     (async () => {
       try {
         await invoke('stop_replay');
         if (key !== 'off') {
           await invoke('start_replay', { target, seconds, fps, quality, resolution, bitrate, mic, micDevice });
+          if (wasOff) toast('Listo para clipear', 'ready');
         }
       } catch (e) {
-        setNotice(`No se pudo iniciar el replay: ${e}`);
+        toast(`No se pudo iniciar el replay: ${e}`, 'error');
         console.error('replay', e);
       }
     })();
@@ -664,10 +671,6 @@
     <div class="content">
       {@render children()}
     </div>
-
-    {#if notice}
-      <button class="notice mono" onclick={() => setNotice(null)}>{notice}</button>
-    {/if}
   </div>
 </div>
 
@@ -1489,29 +1492,5 @@
     overflow-y: auto;
     overflow-x: hidden;
     border-left: 1px solid var(--line);
-  }
-
-  .notice {
-    position: fixed;
-    bottom: 18px;
-    left: 50%;
-    transform: translateX(-50%);
-    max-width: 70%;
-    padding: 9px 14px;
-    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
-    border-radius: 9px;
-    background: var(--bg-2);
-    color: var(--text-1);
-    font-size: 12px;
-    line-height: 1.35;
-    text-align: left;
-    box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
-    cursor: pointer;
-    z-index: 50;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .notice:hover {
-    border-color: var(--accent);
   }
 </style>

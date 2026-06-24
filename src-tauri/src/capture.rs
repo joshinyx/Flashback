@@ -1363,6 +1363,9 @@ mod win {
         // Ventana del juego (modo Aplicación) para consultar el minimizado con IsIconic, sin
         // recorrer todas las ventanas (EnumWindows) en el hilo de bombeo. 0 = sin ventana.
         game_hwnd: isize,
+        // Lo marca el handler de frames cuando la ventana cambia de tamaño: el bombeo sale y el
+        // hilo de replay reconstruye el pipeline al nuevo tamaño.
+        size_changed: Arc<AtomicBool>,
     }
     unsafe impl Send for ReplayPipeline {}
 
@@ -1432,6 +1435,13 @@ mod win {
 
         {
             let mut b = buffer.lock().unwrap();
+            // Si la ventana cambió de tamaño (rebuild por resize), los paquetes ya en el ring
+            // tienen otra resolución/SPS y no se pueden muxear junto a los nuevos: se descartan.
+            // En una reconexión sin cambio de tamaño no entra aquí y el buffer se conserva.
+            if b.width != out_w || b.height != out_h {
+                b.packets.clear();
+                b.seq_header.clear();
+            }
             b.width = out_w;
             b.height = out_h;
             b.fps = fps;
@@ -1518,12 +1528,28 @@ mod win {
         // codificar de más (clave para los perfiles ligeros tipo 480p/20 FPS).
         let interval = fps_interval(fps);
         let last_kept = Arc::new(AtomicI64::new(i64::MIN));
+        // El frame pool se crea a un tamaño fijo (width/height). Si la ventana crece (p. ej. un
+        // juego que pasa a fullscreen/borderless tras armarse el replay), WGC recorta a la
+        // esquina superior izquierda de ese tamaño viejo. Al detectar el cambio se marca y el
+        // bombeo sale para que el hilo reconstruya el pipeline al nuevo tamaño. Un monitor no
+        // cambia de tamaño, así que esto solo afecta a la captura por ventana.
+        let size_changed = Arc::new(AtomicBool::new(false));
         let stats = stats.clone();
         let feed_h = feed.clone();
+        let size_changed_h = size_changed.clone();
         let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
             move |pool, _| {
                 if let Some(pool) = pool.as_ref() {
                     if let Ok(frame) = pool.TryGetNextFrame() {
+                        if let Ok(s) = frame.ContentSize() {
+                            let cw = (s.Width.max(0) as u32) & !1;
+                            let ch = (s.Height.max(0) as u32) & !1;
+                            if cw >= 2 && ch >= 2 && (cw != width || ch != height) {
+                                size_changed_h.store(true, Ordering::Relaxed);
+                                let _ = frame.Close();
+                                return Ok(());
+                            }
+                        }
                         let t = frame.SystemRelativeTime().map(|x| x.Duration).unwrap_or(0);
                         if keep_frame(&last_kept, t, interval) {
                             if let Ok(surface) = frame.Surface() {
@@ -1668,6 +1694,7 @@ mod win {
             mixer,
             card,
             game_hwnd,
+            size_changed,
         })
     }
 
@@ -1967,7 +1994,7 @@ mod win {
         // Seguimiento de minimizado y composición del cartel "fuera de foco" (ver FocusState).
         let mut foc = FocusState::new();
 
-        while !stop.load(Ordering::SeqCst) {
+        while !stop.load(Ordering::SeqCst) && !pipe.size_changed.load(Ordering::Relaxed) {
             foc.poll(window_mode, pipe);
             match pipe.rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(f) => {
@@ -2090,7 +2117,7 @@ mod win {
         let mut pts_fifo: VecDeque<i64> = VecDeque::new();
         let mut foc = FocusState::new();
 
-        while !stop.load(Ordering::SeqCst) {
+        while !stop.load(Ordering::SeqCst) && !pipe.size_changed.load(Ordering::Relaxed) {
             foc.poll(window_mode, pipe);
             if foc.minimized {
                 if let Some(ctime) = foc.card_due() {

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Flashback</title>
+    <style>
+      :root {
+        --accent: #f0f2f7;
+        --rec: #ff5b5b;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+        cursor: default;
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+      #root {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      .toast {
+        display: inline-flex;
+        align-items: center;
+        gap: 14px;
+        max-width: 100%;
+        padding: 14px 24px 14px 18px;
+        /* Lengüeta: pegada al borde derecho, esquinas solo a la izquierda, sin borde derecho. */
+        border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+        border-right: none;
+        border-radius: 12px 0 0 12px;
+        background: rgba(20, 20, 22, 0.96);
+        opacity: 0;
+        transform: translateX(24px);
+        transition: opacity 0.22s ease, transform 0.26s cubic-bezier(0.2, 0.9, 0.3, 1);
+      }
+      .toast.show {
+        opacity: 1;
+        transform: translateX(0);
+      }
+      .toast.error {
+        border-color: color-mix(in srgb, var(--rec) 70%, transparent);
+      }
+      .toast .ico {
+        flex-shrink: 0;
+        width: 30px;
+        height: 30px;
+        display: grid;
+        place-items: center;
+      }
+      .toast .ico img {
+        width: 28px;
+        height: 28px;
+        display: block;
+      }
+      .toast .txt {
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        color: var(--accent);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="toast" id="toast">
+        <span class="ico"><img src="/flashback-mono.svg" alt="" /></span>
+        <span class="txt" id="txt"></span>
+      </div>
+    </div>
+
+    <script>
+      // El backend muestra la ventana (oculta entre avisos) justo antes de emitir; aquí se
+      // pinta el toast y, al terminar la animación de salida, se pide ocultarla de nuevo.
+      const toast = document.getElementById('toast');
+      const txt = document.getElementById('txt');
+      const invoke = window.__TAURI__?.core?.invoke;
+      let hideTimer = null;
+      let exitTimer = null;
+
+      function showToast(text, kind) {
+        if (hideTimer) clearTimeout(hideTimer);
+        if (exitTimer) clearTimeout(exitTimer);
+
+        txt.textContent = text || '';
+        toast.classList.toggle('error', kind === 'error');
+
+        // Reinicia la animación de entrada aunque ya hubiera un toast visible.
+        toast.classList.remove('show');
+        void toast.offsetWidth;
+        toast.classList.add('show');
+
+        hideTimer = setTimeout(() => {
+          toast.classList.remove('show');
+          exitTimer = setTimeout(() => invoke?.('dismiss_toast').catch(() => {}), 320);
+        }, 2800);
+      }
+
+      window.__TAURI__?.event?.listen('show-toast', (e) => {
+        const p = e.payload || {};
+        showToast(p.text, p.kind);
+      });
+    </script>
+  </body>
+</html>

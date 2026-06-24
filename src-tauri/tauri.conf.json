@@ -10,6 +10,7 @@
     "frontendDist": "../build"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Flashback",
@@ -19,6 +20,20 @@
         "minHeight": 675,
         "decorations": false,
         "shadow": true
+      },
+      {
+        "label": "overlay",
+        "url": "overlay.html",
+        "width": 480,
+        "height": 64,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "resizable": false,
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {
