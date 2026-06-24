@@ -4,21 +4,19 @@
 
 ## Overview
 
-Flashback is a lightweight game clip capture and editor for Windows, built with Tauri v2 and Rust. Inspired by Medal and SteelSeries Moments, but with the opposite philosophy: stay extremely light and fast and do one thing well — capture and edit clips, nothing else. No social feed, no achievements, no accounts, no forced cloud.
+Flashback is a lightweight game clip capture and editor for Windows, built with Tauri v2 and Rust. It stays extremely light and fast and does one thing well — capture and edit clips, nothing else. No social feed, no achievements, no accounts, no forced cloud.
 
 The goal is an app you can open, start, and forget is even running.
-
-> **Status:** early development. The feature list below is the target scope, not a finished product.
 
 ---
 
 ## Features
 
-- **Instant Replay** › Save the last X seconds or minutes with a global hotkey
-- **Manual recording** › Start/stop on demand
-- **Configurable quality** › Free resolution, FPS and quality — from ultra-light 480p/20fps to high-end when the hardware allows
-- **Hardware-accelerated encoding** › Auto-selects the best available encoder (NVENC / AMF / Quick Sync), with software fallback
-- **Simple editor** › Trim start and end, remove middle segments, auto-join the rest, export in a few clicks
+- **Instant Replay** › Save the last seconds or minutes with a global hotkey
+- **Manual recording** › Start and stop on demand
+- **Configurable quality** › Adjustable resolution, FPS and quality
+- **Hardware-accelerated encoding** › Uses the best available encoder, with software fallback
+- **Simple editor** › Trim, cut, and export in a few clicks
 - **Local library** › Clips stored locally, no cloud dependency
 
 ---
@@ -52,22 +50,9 @@ The Rust backend does the heavy lifting — capture, the instant-replay buffer, 
 
 ---
 
-## Development
+## Download
 
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)
-- [Rust](https://rustup.rs/) + Cargo
-- [Tauri CLI prerequisites for Windows](https://v2.tauri.app/start/prerequisites/)
-
-```bash
-git clone https://github.com/joshinyx/Flashback.git
-cd Flashback
-pnpm install
-
-pnpm tauri dev    # dev mode with hot reload
-pnpm tauri build  # production build + installer
-```
+Grab the latest installer from the [Releases](https://github.com/joshinyx/Flashback/releases) page.
 
 ---
 
