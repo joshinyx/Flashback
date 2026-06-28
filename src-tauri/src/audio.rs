@@ -3,12 +3,12 @@
 // hilos: cada hilo que lo necesita inicializa su propio apartamento y resuelve el
 // dispositivo por su cuenta.
 
-use std::collections::VecDeque;
+
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+
 
 use windows::core::{Result, GUID, HSTRING, PCWSTR};
 use windows::Win32::Foundation::CloseHandle;
@@ -82,14 +82,23 @@ impl Drop for TrackHandle {
 fn resolve_device(kind: &TrackKind) -> Result<IMMDevice> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-    match kind {
+    let device = match kind {
         TrackKind::SystemLoopback => unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) },
         TrackKind::Microphone(id) => {
             let endpoint = mmdevice_id_from_winrt(id);
             let id = HSTRING::from(endpoint.as_str());
             unsafe { enumerator.GetDevice(&id) }
         }
+    }?;
+    if let Ok(did) = unsafe { device.GetId() } {
+        let did = unsafe { did.to_string() }.unwrap_or_default();
+        let label = match kind {
+            TrackKind::SystemLoopback => "sistema",
+            TrackKind::Microphone(_) => "micrófono",
+        };
+        eprintln!("audio: dispositivo de {label}: {did}");
     }
+    Ok(device)
 }
 
 // La lista de micrófonos se obtiene por WinRT (DeviceInformation), cuyos IDs tienen forma
@@ -594,285 +603,4 @@ fn blob(mt: &IMFMediaType, key: &GUID) -> Option<Vec<u8>> {
         mt.GetBlob(key, &mut v, None).ok()?;
         Some(v)
     }
-}
-
-// ===================== Mezclador (pista 0 = sistema + micro) =====================
-//
-// Combina las dos fuentes PCM ya downmezcladas en una sola pista estéreo que reproduce
-// "todo" por defecto en cualquier player (modelo SteelSeries Moments). Las pistas de
-// sistema y micro se guardan aparte para el mute/solo no destructivo del editor; esta es
-// solo la mezcla de conveniencia. Solo se crea cuando hay ambas fuentes: con una sola, esa
-// pista ya es la que suena por defecto y la mezcla sería redundante.
-//
-// La colocación es por timestamp absoluto (QPC, el mismo reloj en ambas fuentes), así no
-// hay deriva acumulada: cada bloque se suma en su posición temporal exacta. Un pequeño
-// colchón de latencia da margen a que la otra fuente aporte su parte de cada ventana antes
-// de emitirla; lo que falte queda en silencio.
-
-const MIX_LATENCY_HNS: i64 = 1_500_000; // 150 ms
-
-struct SrcState {
-    rate: u32,
-    channels: u16,
-    queue: VecDeque<(i64, Vec<u8>)>,
-}
-
-struct MixerShared {
-    sys: Mutex<SrcState>,
-    mic: Mutex<SrcState>,
-}
-
-struct MixTap {
-    shared: Arc<MixerShared>,
-    mic: bool,
-}
-
-impl PcmTap for MixTap {
-    fn on_pcm(&self, pcm: &[u8], time: i64, _dur: i64) {
-        let m = if self.mic { &self.shared.mic } else { &self.shared.sys };
-        m.lock().unwrap().queue.push_back((time, pcm.to_vec()));
-    }
-}
-
-pub struct MixerHandle {
-    shared: Arc<MixerShared>,
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl MixerHandle {
-    pub fn system_tap(&self) -> Arc<dyn PcmTap> {
-        Arc::new(MixTap { shared: self.shared.clone(), mic: false })
-    }
-
-    pub fn mic_tap(&self) -> Arc<dyn PcmTap> {
-        Arc::new(MixTap { shared: self.shared.clone(), mic: true })
-    }
-
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-impl Drop for MixerHandle {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-// Arranca el hilo del mezclador. Las pistas reales deben pararse ANTES que el mezclador:
-// así, al pararlo, sus colas ya están completas y el flush final no pierde la cola del
-// audio. La mezcla siempre sale estéreo al `out_rate` (el del sistema, fuente continua).
-pub fn spawn_mixer(
-    sys_rate: u32,
-    sys_ch: u16,
-    mic_rate: u32,
-    mic_ch: u16,
-    out_rate: u32,
-    encoding: Encoding,
-    sink: Arc<dyn AudioSink>,
-) -> MixerHandle {
-    let shared = Arc::new(MixerShared {
-        sys: Mutex::new(SrcState { rate: sys_rate, channels: sys_ch, queue: VecDeque::new() }),
-        mic: Mutex::new(SrcState { rate: mic_rate, channels: mic_ch, queue: VecDeque::new() }),
-    });
-    let stop = Arc::new(AtomicBool::new(false));
-    let shared_t = shared.clone();
-    let stop_t = stop.clone();
-    let handle = std::thread::Builder::new()
-        .name("flashback-mixer".into())
-        .spawn(move || {
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            }
-            run_mixer(&shared_t, out_rate, encoding, &sink, &stop_t);
-            unsafe { CoUninitialize() };
-        })
-        .expect("no se pudo crear el hilo del mezclador");
-    MixerHandle { shared, stop, handle: Some(handle) }
-}
-
-fn run_mixer(
-    shared: &Arc<MixerShared>,
-    out_rate: u32,
-    encoding: Encoding,
-    sink: &Arc<dyn AudioSink>,
-    stop: &Arc<AtomicBool>,
-) {
-    let mut aac = match encoding {
-        Encoding::Aac(bitrate) => match build_aac_encoder(out_rate, 2, bitrate) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                eprintln!("audio (mezcla): el encoder AAC rechazó el formato: {e:?}");
-                return;
-            }
-        },
-        Encoding::Pcm => None,
-    };
-
-    let rate = out_rate.max(1) as i64;
-    // Acumulador estéreo intercalado (l, r, l, r, ...) desde `base`. `acc_start` es el
-    // índice de frame absoluto de acc[0]; lo ya emitido se descarta por el frente.
-    let mut acc: Vec<f32> = Vec::new();
-    let mut acc_start: i64 = 0;
-    let mut base: Option<i64> = None;
-    let mut max_time: i64 = i64::MIN;
-    // Cursor de muestra absoluta por fuente: dentro de una racha continua las muestras se
-    // colocan SEGUIDAS (no recalculando el índice desde cada timestamp), lo que evita los
-    // micro-solapes/huecos por jitter del QPC que sonaban como "escarcha". Solo se
-    // resincroniza al timestamp si el salto supera la tolerancia (un hueco real, p. ej.
-    // tras un silencio en el loopback).
-    let mut sys_next: i64 = i64::MIN;
-    let mut mic_next: i64 = i64::MIN;
-    let resync_tol = (rate / 100).max(1); // ~10 ms
-
-    loop {
-        let stopping = stop.load(Ordering::SeqCst);
-
-        let mut drained: Vec<(i64, Vec<u8>, u32, u16, bool)> = Vec::new();
-        {
-            let mut s = shared.sys.lock().unwrap();
-            let (r, c) = (s.rate, s.channels);
-            while let Some((t, pcm)) = s.queue.pop_front() {
-                drained.push((t, pcm, r, c, false));
-            }
-        }
-        {
-            let mut s = shared.mic.lock().unwrap();
-            let (r, c) = (s.rate, s.channels);
-            while let Some((t, pcm)) = s.queue.pop_front() {
-                drained.push((t, pcm, r, c, true));
-            }
-        }
-        drained.sort_by_key(|d| d.0);
-
-        for (t, pcm, r, c, is_mic) in &drained {
-            let b = *base.get_or_insert(*t);
-            let expected = ((*t - b) * rate / 10_000_000).max(0);
-            let cur = if *is_mic { &mut mic_next } else { &mut sys_next };
-            // Racha continua → seguir desde el cursor; salto grande → resincronizar.
-            let start = if *cur == i64::MIN || (expected - *cur).abs() > resync_tol {
-                expected
-            } else {
-                *cur
-            };
-            let placed = place_chunk(&mut acc, acc_start, start, rate, pcm, *r, *c);
-            *cur = start + placed;
-            let end_t = b + *cur * 10_000_000 / rate;
-            max_time = max_time.max(end_t);
-        }
-
-        if let Some(b) = base {
-            // play_head: hasta dónde es seguro emitir. Al parar, se vacía todo (sin colchón).
-            let head_time = if stopping { max_time } else { max_time - MIX_LATENCY_HNS };
-            let head_index = ((head_time - b) * rate / 10_000_000).max(0);
-            let want = (head_index - acc_start).max(0) as usize;
-            let n = want.min(acc.len() / 2);
-            if n > 0 {
-                let mut pcm16 = Vec::with_capacity(n * 4);
-                for k in 0..n {
-                    let l = soft_clip_sample(acc[k * 2]);
-                    let r = soft_clip_sample(acc[k * 2 + 1]);
-                    pcm16.extend_from_slice(&l.to_le_bytes());
-                    pcm16.extend_from_slice(&r.to_le_bytes());
-                }
-                acc.drain(0..n * 2);
-                let time = b + acc_start * 10_000_000 / rate;
-                let dur = n as i64 * 10_000_000 / rate;
-                acc_start += n as i64;
-                emit_encoded(&mut aac, pcm16, time, dur, sink);
-            }
-        }
-
-        if stopping {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-}
-
-// Suma un bloque PCM16 (de `src_ch` canales a `src_rate`) en el acumulador estéreo, a partir
-// de `start_index` (índice de frame absoluto, ya resuelto por el cursor de la fuente). Si los
-// rates difieren, remuestrea por interpolación lineal dentro del propio bloque (calidad
-// suficiente para la pista de conveniencia; las pistas separadas conservan su rate nativo
-// intacto). Mono se sube a estéreo (L=R). Devuelve el nº de frames de salida colocados.
-fn place_chunk(
-    acc: &mut Vec<f32>,
-    acc_start: i64,
-    start_index: i64,
-    out_rate: i64,
-    pcm: &[u8],
-    src_rate: u32,
-    src_ch: u16,
-) -> i64 {
-    let src_ch = src_ch.max(1) as usize;
-    let in_frames = pcm.len() / (src_ch * 2);
-    if in_frames == 0 {
-        return 0;
-    }
-    let rd = |frame: usize, ch: usize| -> f32 {
-        let idx = (frame * src_ch + ch) * 2;
-        i16::from_le_bytes([pcm[idx], pcm[idx + 1]]) as f32
-    };
-    let lr = |frame: usize| -> (f32, f32) {
-        if src_ch == 1 {
-            let m = rd(frame, 0);
-            (m, m)
-        } else {
-            (rd(frame, 0), rd(frame, 1))
-        }
-    };
-
-    let src_rate_i = src_rate.max(1) as i64;
-    let same_rate = src_rate_i == out_rate;
-    let out_frames = if same_rate {
-        in_frames
-    } else {
-        ((in_frames as i64 * out_rate) / src_rate_i).max(0) as usize
-    };
-
-    for k in 0..out_frames {
-        let (l, r) = if same_rate {
-            lr(k.min(in_frames - 1))
-        } else {
-            let pos = k as f64 * src_rate_i as f64 / out_rate as f64;
-            let i0 = (pos.floor() as usize).min(in_frames - 1);
-            let i1 = (i0 + 1).min(in_frames - 1);
-            let frac = (pos - pos.floor()) as f32;
-            let (l0, r0) = lr(i0);
-            let (l1, r1) = lr(i1);
-            (l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac)
-        };
-        let abs_index = start_index + k as i64;
-        if abs_index < acc_start {
-            continue;
-        }
-        let rel = (abs_index - acc_start) as usize;
-        let needed = (rel + 1) * 2;
-        if acc.len() < needed {
-            acc.resize(needed, 0.0);
-        }
-        acc[rel * 2] += l;
-        acc[rel * 2 + 1] += r;
-    }
-    out_frames as i64
-}
-
-// Suma de dos fuentes a tope satura: en vez de recortar en duro (que mete distorsión
-// áspera), aplicamos un soft clip. Lineal por debajo del umbral (transparente para el caso
-// normal de una sola fuente sonando) y compresión suave por encima hasta el máximo. Solo
-// afecta a la pista mezcla; sistema y micro se guardan sin tocar.
-fn soft_clip_sample(x: f32) -> i16 {
-    const T: f32 = 0.75;
-    let n = x / 32768.0;
-    let a = n.abs();
-    let y = if a <= T {
-        n
-    } else {
-        n.signum() * (T + (1.0 - T) * (1.0 - (-(a - T) / (1.0 - T)).exp()))
-    };
-    (y * 32767.0).clamp(-32768.0, 32767.0) as i16
 }

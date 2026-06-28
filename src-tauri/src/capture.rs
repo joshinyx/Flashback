@@ -132,6 +132,7 @@ mod win {
         MONITORINFOEXW, SRCCOPY,
     };
     use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 
     // Valor Win32 de MONITORINFOF_PRIMARY (no lo genera el crate windows).
     const MONITORINFOF_PRIMARY: u32 = 1;
@@ -327,6 +328,7 @@ mod win {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
+        let _timer = TimerRes::new();
 
         let mut engine = match resolve_target_item(&target).and_then(|item| {
             build_engine(
@@ -345,12 +347,44 @@ mod win {
             }
         };
 
+        // Cadencia CFR: el handler de WGC solo refresca el "último frame"; aquí emitimos uno
+        // por slot de reloj (duplicando el último si no llegó otro), de modo que el clip salga
+        // a fps constante. Se espera con wait_timeout para reaccionar al instante a stop().
+        let enc = engine.encoder.clone();
+        let interval = fps_interval(fps).max(1);
+        let mut t0: Option<Instant> = None;
+        let mut emitted: i64 = -1;
         let (lock, cv) = &*stop;
-        let mut stopped = lock.lock().unwrap();
-        while !*stopped {
-            stopped = cv.wait(stopped).unwrap();
+        loop {
+            {
+                let mut e = enc.lock().unwrap();
+                if e.has_frame() {
+                    let now = Instant::now();
+                    let start = *t0.get_or_insert(now);
+                    let cur = elapsed_slots(start, interval);
+                    // Sobrecarga (encoder por debajo de la tasa): no acumular retraso sin fin;
+                    // resincronizar cerca del slot actual. A 60 fps no debería ocurrir.
+                    if cur - emitted > fps as i64 {
+                        emitted = cur - 1;
+                    }
+                    while emitted < cur {
+                        emitted += 1;
+                        let pts = cfr_pts(emitted, fps);
+                        let dur = cfr_pts(emitted + 1, fps) - pts;
+                        let _ = e.emit_paced(pts, dur);
+                    }
+                }
+            }
+            let stopped = lock.lock().unwrap();
+            if *stopped {
+                break;
+            }
+            let (stopped, _) = cv.wait_timeout(stopped, pace_sleep(interval)).unwrap();
+            if *stopped {
+                break;
+            }
+            drop(stopped);
         }
-        drop(stopped);
 
         // Orden de parada: cortar primero la llegada de frames (para que ningún
         // WriteSample corra contra Finalize) y luego cerrar el MP4.
@@ -368,22 +402,14 @@ mod win {
         token: i64,
         encoder: Arc<Mutex<Encoder>>,
         audio_tracks: Vec<audio::TrackHandle>,
-        // Se para DESPUÉS de las pistas: su flush final ve las colas completas y escribe
-        // la mezcla antes de Finalize().
-        mixer: Option<audio::MixerHandle>,
     }
 
     impl Engine {
-        // Cortar primero las fuentes (WGC + audio) y solo entonces dejar finalizar el
-        // encoder: ningún WriteSample debe poder correr contra Finalize().
         fn shutdown(&mut self) {
             let _ = self.frame_pool.RemoveFrameArrived(self.token);
             let _ = self.session.Close();
             for track in &mut self.audio_tracks {
                 track.stop();
-            }
-            if let Some(m) = self.mixer.as_mut() {
-                m.stop();
             }
         }
 
@@ -443,15 +469,10 @@ mod win {
         };
         let sys_target = sys_native.and_then(|(r, c)| audio::aac_target_format(r, c));
         let mic_target = mic_native.and_then(|(r, c)| audio::aac_target_format(r, c));
-        // Pista mezcla (estéreo, al rate del sistema) solo cuando hay ambas fuentes.
-        let mix_target = match (sys_target, mic_target) {
-            (Some((sys_rate, _)), Some(_)) => Some((sys_rate, 2u16)),
-            _ => None,
-        };
 
         let out_path = format!("{out_dir}\\{}", clip_filename());
         let encoder = Arc::new(Mutex::new(Encoder::new(
-            &device, width, height, out_w, out_h, fps, bitrate, out_path, mix_target, sys_target,
+            &device, width, height, out_w, out_h, fps, bitrate, out_path, sys_target,
             mic_target,
         )?));
 
@@ -490,7 +511,9 @@ mod win {
                                     if let Ok(tex) =
                                         unsafe { access.GetInterface::<ID3D11Texture2D>() }
                                     {
-                                        let _ = enc.lock().unwrap().push(&tex, t);
+                                        // Solo refresca el "último frame" (copia GPU→GPU); la
+                                        // emisión a cadencia CFR la hace el hilo de captura.
+                                        enc.lock().unwrap().note_frame(&tex, t);
                                     }
                                 }
                             }
@@ -504,26 +527,6 @@ mod win {
         );
         let token = frame_pool.FrameArrived(&handler)?;
 
-        // Mezclador (pista 0): solo con ambas fuentes. Produce PCM estéreo y lo entrega al
-        // SinkWriter por el mismo camino que las pistas (este codifica el AAC). Se crea
-        // antes de las pistas para repartirles sus taps.
-        let mixer = match (sys_target, mic_target) {
-            (Some((sys_rate, sys_ch)), Some((mic_rate, mic_ch))) => {
-                let stream = encoder.lock().unwrap().mix_audio_stream.expect("stream de mezcla declarado");
-                let sink = Arc::new(EncoderAudioSink { encoder: encoder.clone(), stream });
-                Some(audio::spawn_mixer(
-                    sys_rate,
-                    sys_ch,
-                    mic_rate,
-                    mic_ch,
-                    sys_rate,
-                    audio::Encoding::Pcm,
-                    sink,
-                ))
-            }
-            _ => None,
-        };
-
         let mut audio_tracks = Vec::new();
         if let (Some((rate, ch)), Some(_)) = (sys_native, sys_target) {
             let stream = encoder.lock().unwrap().sys_audio_stream.expect("stream de sistema declarado");
@@ -534,7 +537,7 @@ mod win {
                 rate,
                 ch,
                 sink,
-                mixer.as_ref().map(|m| m.system_tap()),
+                None,
             ));
         }
         if let (Some((rate, ch)), Some(_)) = (mic_native, mic_target) {
@@ -546,7 +549,7 @@ mod win {
                 rate,
                 ch,
                 sink,
-                mixer.as_ref().map(|m| m.mic_tap()),
+                None,
             ));
         }
 
@@ -559,7 +562,6 @@ mod win {
             token,
             encoder,
             audio_tracks,
-            mixer,
         })
     }
 
@@ -595,14 +597,15 @@ mod win {
     struct Encoder {
         writer: IMFSinkWriter,
         stream: u32,
-        mix_audio_stream: Option<u32>,
         sys_audio_stream: Option<u32>,
         mic_audio_stream: Option<u32>,
         ctx: ID3D11DeviceContext,
         pool: Vec<ID3D11Texture2D>,
         next: usize,
+        // Índice en `pool` del último frame real recibido de WGC; lo emite la cadencia CFR,
+        // duplicándolo en los slots sin frame nuevo. None hasta que llega el primero.
+        latest: Option<usize>,
         base: i64,
-        last: i64,
         has_base: bool,
         path: String,
         finalized: bool,
@@ -628,7 +631,6 @@ mod win {
             fps: u32,
             bitrate: u32,
             path: String,
-            mix_audio: Option<(u32, u16)>,
             sys_audio: Option<(u32, u16)>,
             mic_audio: Option<(u32, u16)>,
         ) -> Result<Encoder> {
@@ -687,12 +689,7 @@ mod win {
             }
 
             // PCM crudo de entrada: el SinkWriter resuelve su propio MFT AAC, igual que
-            // ya resuelve el MFT H.264 a partir del tipo de vídeo declarado arriba. La
-            // mezcla se declara primero para que sea la pista de audio por defecto.
-            let mix_audio_stream = match mix_audio {
-                Some((rate, ch)) => Some(add_aac_stream(&writer, rate, ch)?),
-                None => None,
-            };
+            // ya resuelve el MFT H.264 a partir del tipo de vídeo declarado arriba.
             let sys_audio_stream = match sys_audio {
                 Some((rate, ch)) => Some(add_aac_stream(&writer, rate, ch)?),
                 None => None,
@@ -733,14 +730,13 @@ mod win {
             Ok(Encoder {
                 writer,
                 stream,
-                mix_audio_stream,
                 sys_audio_stream,
                 mic_audio_stream,
                 ctx,
                 pool,
                 next: 0,
+                latest: None,
                 base: 0,
-                last: 0,
                 has_base: false,
                 path,
                 finalized: false,
@@ -748,17 +744,16 @@ mod win {
             })
         }
 
-        // El audio no se ancla a keyframes: cada paquete AAC es independiente. La base
-        // de tiempo es compartida con el vídeo (gana el primer push, sea cual sea), así
-        // que se acota a 0 por si una pista de audio arranca un pelín antes que el vídeo.
+        // El audio no se ancla a keyframes: cada paquete AAC es independiente. La base de
+        // tiempo la fija siempre el primer frame de vídeo (note_frame), porque el PTS del
+        // vídeo es sintético (cadencia CFR) y arranca en 0 en ese instante; el audio se
+        // rebasa contra esa misma base. Mientras no haya base aún se descartan los paquetes
+        // (no hay forma fiable de alinearlos), igual que en el Instant Replay.
         fn push_audio(&mut self, stream: u32, data: Vec<u8>, time: i64, dur: i64) {
-            let ts = if self.has_base {
-                (time - self.base).max(0)
-            } else {
-                self.has_base = true;
-                self.base = time;
-                0
-            };
+            if !self.has_base {
+                return;
+            }
+            let ts = (time - self.base).max(0);
             let len = data.len();
             let Ok(mf_buf) = (unsafe { MFCreateMemoryBuffer(len as u32) }) else {
                 return;
@@ -792,31 +787,44 @@ mod win {
             }
         }
 
-        fn push(&mut self, src: &ID3D11Texture2D, time: i64) -> Result<()> {
-            let ts = if self.has_base {
-                time - self.base
-            } else {
+        // Copia el frame WGC a un slot del pool (GPU→GPU, sin bajar a CPU: el camino sagrado)
+        // y lo marca como el "último" disponible. NO codifica aquí: el hilo de cadencia decide
+        // cuándo emitirlo. El primer frame fija la base temporal del vídeo, contra la que se
+        // rebasa el audio. Solo rota a un slot nuevo; el anterior sigue intacto para que la
+        // cadencia pueda duplicarlo mientras no llegue otro frame.
+        fn note_frame(&mut self, src: &ID3D11Texture2D, time: i64) {
+            if !self.has_base {
                 self.has_base = true;
                 self.base = time;
-                0
-            };
-
-            let dst = self.pool[self.next].clone();
+            }
+            let idx = self.next;
             self.next = (self.next + 1) % self.pool.len();
-            unsafe { self.ctx.CopyResource(&dst, src) };
+            unsafe { self.ctx.CopyResource(&self.pool[idx], src) };
+            self.latest = Some(idx);
+        }
 
+        fn has_frame(&self) -> bool {
+            self.latest.is_some()
+        }
+
+        // Escribe el último frame disponible con un PTS sintético de cadencia constante. Se
+        // llama una vez por slot vencido; un slot sin frame nuevo reescribe el mismo (frame
+        // duplicado), que el encoder resuelve como P-frame "skip" de coste ínfimo.
+        fn emit_paced(&mut self, pts: i64, dur: i64) -> Result<()> {
+            let Some(idx) = self.latest else {
+                return Ok(());
+            };
+            let dst = self.pool[idx].clone();
             let buffer =
                 unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &dst, 0, false)? };
             let len = unsafe { buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()? };
             unsafe { buffer.SetCurrentLength(len)? };
 
             let sample = unsafe { MFCreateSample()? };
-            let dur = if ts > self.last { ts - self.last } else { 166_667 };
-            self.last = ts;
             unsafe {
                 sample.AddBuffer(&buffer)?;
-                sample.SetSampleTime(ts)?;
-                sample.SetSampleDuration(dur)?;
+                sample.SetSampleTime(pts)?;
+                sample.SetSampleDuration(dur.max(1))?;
                 self.writer.WriteSample(self.stream, &sample)?;
             }
             Ok(())
@@ -928,8 +936,6 @@ mod win {
         fps: u32,
         bitrate: u32,
         window_ns: i64,
-        // Pista 0 = mezcla (sistema + micro): la que suena por defecto en cualquier player.
-        mix_audio: Option<AudioTrackBuf>,
         sys_audio: Option<AudioTrackBuf>,
         mic_audio: Option<AudioTrackBuf>,
     }
@@ -944,7 +950,6 @@ mod win {
                 fps,
                 bitrate,
                 window_ns: seconds.max(1) as i64 * 10_000_000,
-                mix_audio: None,
                 sys_audio: None,
                 mic_audio: None,
             }
@@ -954,11 +959,7 @@ mod win {
             &mut self,
             sys: Option<(u32, u16)>,
             mic: Option<(u32, u16)>,
-            mix: Option<(u32, u16)>,
         ) {
-            if let Some((rate, ch)) = mix {
-                self.mix_audio = Some(AudioTrackBuf::new(rate, ch, aac_bitrate(ch), self.window_ns));
-            }
             if let Some((rate, ch)) = sys {
                 self.sys_audio = Some(AudioTrackBuf::new(rate, ch, aac_bitrate(ch), self.window_ns));
             }
@@ -969,7 +970,6 @@ mod win {
 
         fn track_mut(&mut self, role: AudioRole) -> Option<&mut AudioTrackBuf> {
             match role {
-                AudioRole::Mix => self.mix_audio.as_mut(),
                 AudioRole::Sys => self.sys_audio.as_mut(),
                 AudioRole::Mic => self.mic_audio.as_mut(),
             }
@@ -1121,7 +1121,7 @@ mod win {
             (r.buffer.clone(), r.out_dir.clone())
         };
 
-        let (packets, total, seq_header, width, height, fps, bitrate, mix_audio, sys_audio, mic_audio) = {
+        let (packets, total, seq_header, width, height, fps, bitrate, sys_audio, mic_audio) = {
             let buf = buffer.lock().unwrap();
             let start = buf.packets.iter().position(|p| p.key);
             let pkts: Vec<(Vec<u8>, i64, i64, bool)> = match start {
@@ -1141,7 +1141,6 @@ mod win {
                 buf.height,
                 buf.fps,
                 buf.bitrate,
-                buf.mix_audio.as_ref().map(AudioMuxTrack::from),
                 buf.sys_audio.as_ref().map(AudioMuxTrack::from),
                 buf.mic_audio.as_ref().map(AudioMuxTrack::from),
             )
@@ -1161,14 +1160,6 @@ mod win {
         // escribir el `esds`; sin él, Finalize falla con MF_E_SINK_HEADERS_NOT_FOUND. Si una
         // pista no llegó a producir ese config (p. ej. el encoder AAC no pudo con el formato
         // del dispositivo) se omite, y el replay se guarda solo con vídeo en vez de fallar.
-        let mix_audio = match mix_audio {
-            Some(t) if !t.user_data.is_empty() && !t.packets.is_empty() => Some(t),
-            Some(_) => {
-                eprintln!("save_replay: pista mezcla omitida (sin config AAC válida)");
-                None
-            }
-            None => None,
-        };
         let sys_audio = match sys_audio {
             Some(t) if !t.user_data.is_empty() && !t.packets.is_empty() => Some(t),
             Some(_) => {
@@ -1197,7 +1188,7 @@ mod win {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
             let r = mux_replay(
-                &path_t, &packets, &seq_header, width, height, fps, bitrate, mix_audio, sys_audio,
+                &path_t, &packets, &seq_header, width, height, fps, bitrate, sys_audio,
                 mic_audio,
             )
             .map_err(|e| format!("{e:?}"));
@@ -1249,6 +1240,7 @@ mod win {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
+        let _timer = TimerRes::new();
 
         let _ = seconds;
 
@@ -1326,9 +1318,6 @@ mod win {
         for track in &mut pipe.audio_tracks {
             track.stop();
         }
-        if let Some(m) = pipe.mixer.as_mut() {
-            m.stop();
-        }
         let _ = pipe.frame_pool.Close();
         drop(pipe);
     }
@@ -1336,6 +1325,8 @@ mod win {
     struct ReplayPipeline {
         _device: ID3D11Device,
         _manager: IMFDXGIDeviceManager,
+        // fps objetivo: lo usa el bombeo para la cadencia CFR (cfr_pts/fps_interval).
+        fps: u32,
         converter: IMFTransform,
         encoder: IMFTransform,
         // None => encoder síncrono por software (no genera eventos): se bombea distinto.
@@ -1355,8 +1346,6 @@ mod win {
         // vídeo (ver run_pump_async/sync y los AudioSink de más abajo).
         video_base: Arc<AtomicI64>,
         audio_tracks: Vec<audio::TrackHandle>,
-        // Se para DESPUÉS de las pistas: así su flush final ve las colas completas.
-        mixer: Option<audio::MixerHandle>,
         // Cartel "fuera de foco" (solo modo ventana): se compone una vez al minimizar y se
         // codifica en lugar de los frames congelados. `tex` es su lienzo BGRA de salida.
         card: Option<Card>,
@@ -1427,11 +1416,6 @@ mod win {
         };
         let sys_target = sys_native.and_then(|(r, c)| audio::aac_target_format(r, c));
         let mic_target = mic_native.and_then(|(r, c)| audio::aac_target_format(r, c));
-        // Pista mezcla (estéreo, al rate del sistema) solo cuando hay ambas fuentes.
-        let mix_target = match (sys_target, mic_target) {
-            (Some((sys_rate, _)), Some(_)) => Some((sys_rate, 2u16)),
-            _ => None,
-        };
 
         {
             let mut b = buffer.lock().unwrap();
@@ -1446,7 +1430,7 @@ mod win {
             b.height = out_h;
             b.fps = fps;
             b.bitrate = bitrate;
-            b.init_audio(sys_target, mic_target, mix_target);
+            b.init_audio(sys_target, mic_target);
         }
 
         // Device manager compartido (zero-copy GPU) y device protegido para multihilo.
@@ -1591,29 +1575,6 @@ mod win {
         // bombeo de vídeo (run_pump_async/sync) en cuanto llega el primer frame.
         let video_base = Arc::new(AtomicI64::new(i64::MIN));
 
-        // Mezclador: solo si hay ambas fuentes. Produce la pista 0 (mezcla) a partir del
-        // PCM "tapeado" de las dos pistas, alineado por QPC. Se crea antes de las pistas
-        // para repartirles sus taps.
-        let mixer = match (sys_target, mic_target) {
-            (Some((sys_rate, sys_ch)), Some((mic_rate, mic_ch))) => {
-                let sink = Arc::new(ReplayAudioSink {
-                    buffer: buffer.clone(),
-                    video_base: video_base.clone(),
-                    role: AudioRole::Mix,
-                });
-                Some(audio::spawn_mixer(
-                    sys_rate,
-                    sys_ch,
-                    mic_rate,
-                    mic_ch,
-                    sys_rate,
-                    audio::Encoding::Aac(aac_bitrate(2)),
-                    sink,
-                ))
-            }
-            _ => None,
-        };
-
         let mut audio_tracks = Vec::new();
         if let (Some((rate, ch)), Some((_, dst_ch))) = (sys_native, sys_target) {
             let sink = Arc::new(ReplayAudioSink {
@@ -1627,7 +1588,7 @@ mod win {
                 rate,
                 ch,
                 sink,
-                mixer.as_ref().map(|m| m.system_tap()),
+                None,
             ));
         }
         if let (Some((rate, ch)), Some((_, dst_ch))) = (mic_native, mic_target) {
@@ -1642,7 +1603,7 @@ mod win {
                 rate,
                 ch,
                 sink,
-                mixer.as_ref().map(|m| m.mic_tap()),
+                None,
             ));
         }
 
@@ -1678,6 +1639,7 @@ mod win {
         Ok(ReplayPipeline {
             _device: device,
             _manager: manager,
+            fps,
             converter,
             encoder,
             enc_events,
@@ -1691,7 +1653,6 @@ mod win {
             rx,
             video_base,
             audio_tracks,
-            mixer,
             card,
             game_hwnd,
             size_changed,
@@ -1927,7 +1888,6 @@ mod win {
     // (i64::MIN) se descartan los paquetes, ya que no hay forma fiable de alinearlos.
     #[derive(Clone, Copy)]
     enum AudioRole {
-        Mix,
         Sys,
         Mic,
     }
@@ -1970,8 +1930,47 @@ mod win {
         }
     }
 
-    // Bombeo del encoder por hardware (MFT asíncrono, dirigido por eventos): acumula
-    // crédito de NEED_INPUT y alimenta según lo pide el encoder.
+    // Slots de cadencia transcurridos desde `start` (cada slot dura `interval` en 100 ns).
+    fn elapsed_slots(start: Instant, interval: i64) -> i64 {
+        let hns = (Instant::now().saturating_duration_since(start).as_nanos() as i64) / 100;
+        hns / interval.max(1)
+    }
+
+    // Espera de cadencia: por debajo de un periodo de frame para no quemar CPU ni perder
+    // slots. Con timeBeginPeriod(1) activo el sleep es preciso a ~1 ms.
+    fn pace_sleep(interval: i64) -> Duration {
+        let ms = (interval / 20_000).clamp(1, 8);
+        Duration::from_millis(ms as u64)
+    }
+
+    // Alimenta una muestra NV12 al encoder asíncrono, drenando su salida y reintentando si
+    // rechaza la entrada (NOTACCEPTING). Devuelve true si el encoder la aceptó.
+    fn feed_encoder_async(
+        pipe: &ReplayPipeline,
+        nv12: &IMFSample,
+        buffer: &Arc<Mutex<ReplayBuffer>>,
+        seq_grabbed: &mut bool,
+        pts_fifo: &mut VecDeque<i64>,
+    ) -> bool {
+        for _ in 0..64 {
+            match unsafe { pipe.encoder.ProcessInput(0, nv12, 0) } {
+                Ok(()) => return true,
+                Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                    let n = drain_encoder_output(pipe, buffer, seq_grabbed, pts_fifo).unwrap_or(0);
+                    if n == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    // Bombeo del encoder por hardware (MFT asíncrono): cadencia CFR dirigida por reloj.
+    // Drena WGC sin bloquear para mantener el "último frame real" y, en cada slot vencido,
+    // alimenta ese frame (duplicándolo si no llegó uno nuevo) con PTS = cfr_pts(slot),
+    // siempre que el encoder tenga crédito de NEED_INPUT. Así el clip sale a fps constante.
     fn run_pump_async(
         pipe: &ReplayPipeline,
         stop: &Arc<AtomicBool>,
@@ -1979,52 +1978,49 @@ mod win {
         window_mode: bool,
     ) {
         let events = pipe.enc_events.as_ref().expect("async pump requiere eventos");
+        let fps = pipe.fps;
+        let interval = fps_interval(fps).max(1);
         let mut need: i32 = 0;
-        let mut base: Option<i64> = None;
         let mut seq_grabbed = false;
-        // Tope de la cola pre-encoder: si el encoder no sostiene la tasa (p. ej. 240 fps) se
-        // descartan frames en vez de acumular memoria/latencia. A tasas sostenibles no se llena.
-        const MAX_PENDING: usize = 16;
-        let mut pending: VecDeque<(SendTex, i64)> = VecDeque::new();
         // Timestamps de entrada en el orden en que se alimentan al encoder. Como el
         // encoder va en Baseline (sin reordenar), la N-ésima salida corresponde al
-        // N-ésimo timestamp aquí: así fijamos el tiempo real del frame en cada paquete.
+        // N-ésimo timestamp aquí: así fijamos el tiempo del frame en cada paquete.
         let mut pts_fifo: VecDeque<i64> = VecDeque::new();
-        let mut last_pts: i64 = 0;
         // Seguimiento de minimizado y composición del cartel "fuera de foco" (ver FocusState).
         let mut foc = FocusState::new();
+        // Último frame real recibido de WGC; se duplica en los slots sin frame nuevo.
+        let mut latest: Option<ID3D11Texture2D> = None;
+        // Reloj de cadencia: t0 se ancla al primer frame emitido; `emitted` es el último slot
+        // codificado y `emitted_pts` su PTS (monotonía en la frontera con el cartel).
+        let mut t0: Option<Instant> = None;
+        let mut emitted: i64 = -1;
+        let mut emitted_pts: i64 = -1;
 
         while !stop.load(Ordering::SeqCst) && !pipe.size_changed.load(Ordering::Relaxed) {
             foc.poll(window_mode, pipe);
-            match pipe.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(f) => {
-                    foc.note_real_frame(&f.0 .0, f.1);
-                    if !foc.minimized {
-                        pending.push_back(f);
-                        if pending.len() > MAX_PENDING {
-                            pending.pop_front();
+
+            // Drenar la cola sin bloquear: solo nos quedamos con el frame más reciente; el
+            // resto se descarta porque estamos remuestreando a una cadencia fija.
+            loop {
+                match pipe.rx.try_recv() {
+                    Ok(f) => {
+                        foc.note_real_frame(&f.0 .0, f.1);
+                        if !foc.minimized {
+                            latest = Some(f.0 .0);
                         }
                     }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            // Mientras el juego esté minimizado, en vez de codificar frames congelados se
-            // inyecta el cartel a baja cadencia (suficiente para keyframes; coste ínfimo).
-            if let Some(ctime) = foc.card_due() {
-                if let Some(c) = pipe.card.as_ref() {
-                    pending.push_back((SendTex(c.tex.clone()), ctime));
-                }
-            }
             // El siguiente frame alimentado (cartel al minimizar, o real al volver) arranca un
-            // GOP nuevo. Mientras está minimizado la cola solo lleva carteles, así que el IDR
-            // cae en el cartel; al volver, en el primer frame real.
+            // GOP nuevo, para que la transición cartel↔juego no arrastre referencias.
             if foc.take_force_key() {
                 force_keyframe(pipe);
             }
 
-            // Drenar eventos del encoder asíncrono sin bloquear.
+            // Drenar eventos del encoder asíncrono sin bloquear (créditos + salida).
             loop {
                 let ev = unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
                 let ev = match ev {
@@ -2039,143 +2035,163 @@ mod win {
                 }
             }
 
-            while need > 0 {
-                let Some((tex, time)) = pending.pop_front() else {
-                    break;
-                };
-                let rebased = match base {
-                    Some(b) => (time - b).max(last_pts + 1),
-                    None => {
-                        base = Some(time);
-                        pipe.video_base.store(time, Ordering::SeqCst);
-                        0
-                    }
-                };
-                last_pts = rebased;
-
-                // BGRA→NV12. Si el conversor no da salida (o falla) saltamos el frame
-                // pero NO descontamos `need`: el encoder sigue esperando esa entrada,
-                // así que la cubre el siguiente frame (si lo descontáramos, el encoder
-                // se quedaría esperando para siempre y el pipeline se atascaría).
-                let nv12 = match convert_frame(pipe, &tex.0, rebased) {
-                    Ok(Some(s)) => s,
-                    Ok(None) => continue,
-                    Err(_) => continue,
-                };
-
-                // Entregar al encoder. El MFT por hardware a veces emite NEED_INPUT del
-                // frame siguiente antes de drenar la salida del anterior; si rechaza la
-                // entrada (NOTACCEPTING) drenamos la salida pendiente y reintentamos.
-                let mut fed_ok = false;
-                for _ in 0..64 {
-                    let hr = unsafe { pipe.encoder.ProcessInput(0, &nv12, 0) };
-                    match hr {
-                        Ok(()) => {
-                            fed_ok = true;
-                            break;
-                        }
-                        Err(e) if e.code() == MF_E_NOTACCEPTING => {
-                            let n = drain_encoder_output(pipe, buffer, &mut seq_grabbed, &mut pts_fifo)
-                                .unwrap_or(0);
-                            if n == 0 {
-                                // Nada que drenar aún: dar un respiro al hardware.
-                                std::thread::sleep(Duration::from_millis(1));
+            if foc.minimized {
+                // Suspender la cadencia CFR: el puntero de slot avanza con el reloj pero no
+                // codificamos duplicados (evita un golpe al restaurar). El cartel cubre el
+                // tramo a baja cadencia, anclando su PTS a la rejilla de slots.
+                if let Some(start) = t0 {
+                    emitted = emitted.max(elapsed_slots(start, interval));
+                }
+                // card_due() avanza su reloj interno como efecto secundario, así que solo se
+                // consulta cuando hay crédito para emitir (si no, perderíamos cartelitos).
+                if need > 0 && foc.card_due().is_some() {
+                    if let Some(c) = pipe.card.as_ref() {
+                        let slot = emitted + 1;
+                        let pts = cfr_pts(slot, fps).max(emitted_pts + 1);
+                        if let Ok(Some(nv12)) = convert_frame(pipe, &c.tex, pts) {
+                            if feed_encoder_async(pipe, &nv12, buffer, &mut seq_grabbed, &mut pts_fifo) {
+                                pts_fifo.push_back(pts);
+                                need -= 1;
+                                emitted = slot;
+                                emitted_pts = pts;
                             }
                         }
-                        Err(_) => break,
                     }
+                }
+            } else if let Some(src) = latest.clone() {
+                let now = Instant::now();
+                let start = *t0.get_or_insert_with(|| {
+                    // Primer frame: fija el origen temporal del vídeo (escala WGC) para que el
+                    // audio, que se rebasa contra video_base, comparta el cero con el vídeo.
+                    pipe.video_base.store(foc.last_time, Ordering::SeqCst);
+                    now
+                });
+                let cur = elapsed_slots(start, interval);
+                // Si el encoder no sostiene la tasa (posible a 240), `emitted` se quedaría atrás
+                // del reloj sin fin y el PTS se desincronizaría del audio. Resincronizamos cerca
+                // del slot actual descartando los duplicados atrasados (CFR best-effort con algún
+                // hueco; a 60 no ocurre).
+                if cur - emitted > fps as i64 {
+                    emitted = cur - 1;
+                    emitted_pts = emitted_pts.max(cfr_pts(emitted, fps));
                 }
 
-                if fed_ok {
-                    pts_fifo.push_back(rebased);
-                    need -= 1;
-                } else {
-                    // No se pudo alimentar (encoder ocupado): devolvemos el frame al frente
-                    // para reintentarlo cuando el encoder libere salida, en vez de perderlo
-                    // (lo que bajaba el recuento de FPS a bitrates altos). Si la cola ya está
-                    // llena, el encoder no sostiene la tasa y se descarta (inevitable a 240).
-                    if pending.len() < MAX_PENDING {
-                        pending.push_front((tex, time));
+                // Un frame por slot vencido mientras el encoder acepte entrada. Los duplicados
+                // (sin frame nuevo) salen como P-frames "skip": coste ínfimo. Nunca pasamos del
+                // slot actual, así que no alimentamos por delante del reloj.
+                while emitted < cur && need > 0 {
+                    let slot = emitted + 1;
+                    let pts = cfr_pts(slot, fps).max(emitted_pts + 1);
+                    let nv12 = match convert_frame(pipe, &src, pts) {
+                        Ok(Some(s)) => s,
+                        _ => break,
+                    };
+                    if feed_encoder_async(pipe, &nv12, buffer, &mut seq_grabbed, &mut pts_fifo) {
+                        pts_fifo.push_back(pts);
+                        need -= 1;
+                        emitted = slot;
+                        emitted_pts = pts;
+                    } else {
+                        break;
                     }
-                    break;
                 }
             }
+
+            std::thread::sleep(pace_sleep(interval));
         }
     }
 
-    // Bombeo del encoder por software (MFT síncrono): no hay eventos; por cada frame se
-    // convierte, se entrega con ProcessInput y se drena la salida hasta NEED_MORE_INPUT.
+    // Bombeo del encoder por software (MFT síncrono, sin eventos): misma cadencia CFR
+    // dirigida por reloj que el camino hardware, pero codificando de forma síncrona un
+    // frame por slot vencido (duplicando el último cuando no hay frame nuevo).
     fn run_pump_sync(
         pipe: &ReplayPipeline,
         stop: &Arc<AtomicBool>,
         buffer: &Arc<Mutex<ReplayBuffer>>,
         window_mode: bool,
     ) {
-        let mut base: Option<i64> = None;
-        let mut last_pts: i64 = 0;
+        let fps = pipe.fps;
+        let interval = fps_interval(fps).max(1);
         let mut seq_grabbed = false;
         let mut pts_fifo: VecDeque<i64> = VecDeque::new();
         let mut foc = FocusState::new();
+        let mut latest: Option<ID3D11Texture2D> = None;
+        let mut t0: Option<Instant> = None;
+        let mut emitted: i64 = -1;
+        let mut emitted_pts: i64 = -1;
 
         while !stop.load(Ordering::SeqCst) && !pipe.size_changed.load(Ordering::Relaxed) {
             foc.poll(window_mode, pipe);
-            if foc.minimized {
-                if let Some(ctime) = foc.card_due() {
-                    if let Some(c) = pipe.card.as_ref() {
-                        if foc.take_force_key() {
-                            force_keyframe(pipe);
+
+            loop {
+                match pipe.rx.try_recv() {
+                    Ok(f) => {
+                        foc.note_real_frame(&f.0 .0, f.1);
+                        if !foc.minimized {
+                            latest = Some(f.0 .0);
                         }
-                        encode_one(
-                            pipe, buffer, &c.tex, ctime, &mut base, &mut last_pts,
-                            &mut seq_grabbed, &mut pts_fifo,
-                        );
                     }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
                 }
-                // Vaciar y descartar cualquier frame congelado que aún llegue de WGC.
-                let _ = pipe.rx.recv_timeout(Duration::from_millis(50));
-                continue;
             }
-            let (tex, time) = match pipe.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(f) => f,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-            foc.note_real_frame(&tex.0, time);
+
             if foc.take_force_key() {
                 force_keyframe(pipe);
             }
-            encode_one(
-                pipe, buffer, &tex.0, time, &mut base, &mut last_pts, &mut seq_grabbed,
-                &mut pts_fifo,
-            );
+
+            if foc.minimized {
+                if let Some(start) = t0 {
+                    emitted = emitted.max(elapsed_slots(start, interval));
+                }
+                if foc.card_due().is_some() {
+                    if let Some(c) = pipe.card.as_ref() {
+                        let slot = emitted + 1;
+                        let pts = cfr_pts(slot, fps).max(emitted_pts + 1);
+                        encode_one(pipe, buffer, &c.tex, pts, &mut seq_grabbed, &mut pts_fifo);
+                        emitted = slot;
+                        emitted_pts = pts;
+                    }
+                }
+            } else if let Some(src) = latest.clone() {
+                let now = Instant::now();
+                let start = *t0.get_or_insert_with(|| {
+                    pipe.video_base.store(foc.last_time, Ordering::SeqCst);
+                    now
+                });
+                let cur = elapsed_slots(start, interval);
+                // Si el encoder software no sostiene la tasa, no acumular retraso sin fin:
+                // saltar cerca del slot actual descartando duplicados (CFR best-effort, solo
+                // en sobrecarga). A perfiles ligeros (p. ej. 480p/20) no ocurre.
+                if cur - emitted > fps as i64 {
+                    emitted = cur - 1;
+                    emitted_pts = emitted_pts.max(cfr_pts(emitted, fps));
+                }
+                while emitted < cur {
+                    let slot = emitted + 1;
+                    let pts = cfr_pts(slot, fps).max(emitted_pts + 1);
+                    encode_one(pipe, buffer, &src, pts, &mut seq_grabbed, &mut pts_fifo);
+                    emitted = slot;
+                    emitted_pts = pts;
+                }
+            }
+
+            std::thread::sleep(pace_sleep(interval));
         }
     }
 
-    // Codifica un frame BGRA: BGRA→NV12 y entrega al encoder, drenando su salida al ring.
-    // `last_pts` mantiene los timestamps estrictamente crecientes (el cartel usa un reloj
-    // distinto al de WGC, así que sin esto podrían cruzarse al reanudar).
-    #[allow(clippy::too_many_arguments)]
+    // Codifica un frame BGRA con un PTS sintético ya calculado (cadencia CFR): BGRA→NV12 y
+    // entrega al encoder, drenando su salida al ring. El PTS llega ya monotónico desde el
+    // bombeo, así que aquí no se rebasa nada.
     fn encode_one(
         pipe: &ReplayPipeline,
         buffer: &Arc<Mutex<ReplayBuffer>>,
         bgra: &ID3D11Texture2D,
-        time: i64,
-        base: &mut Option<i64>,
-        last_pts: &mut i64,
+        pts: i64,
         seq_grabbed: &mut bool,
         pts_fifo: &mut VecDeque<i64>,
     ) {
-        let rebased = match *base {
-            Some(b) => (time - b).max(*last_pts + 1),
-            None => {
-                *base = Some(time);
-                pipe.video_base.store(time, Ordering::SeqCst);
-                0
-            }
-        };
-        *last_pts = rebased;
-
-        let nv12 = match convert_frame(pipe, bgra, rebased) {
+        let nv12 = match convert_frame(pipe, bgra, pts) {
             Ok(Some(s)) => s,
             _ => return,
         };
@@ -2194,7 +2210,7 @@ mod win {
             }
         }
         if fed_ok {
-            pts_fifo.push_back(rebased);
+            pts_fifo.push_back(pts);
             let _ = drain_encoder_output(pipe, buffer, seq_grabbed, pts_fifo);
         }
     }
@@ -2538,7 +2554,6 @@ mod win {
         height: u32,
         fps: u32,
         bitrate: u32,
-        mix_audio: Option<AudioMuxTrack>,
         sys_audio: Option<AudioMuxTrack>,
         mic_audio: Option<AudioMuxTrack>,
     ) -> Result<()> {
@@ -2592,12 +2607,7 @@ mod win {
         // Passthrough: el input del stream es el mismo H.264 ya codificado.
         unsafe { writer.SetInputMediaType(stream, &h264, None)? };
 
-        // La pista mezcla se declara primero: el sink MP4 marca como audio por defecto la
-        // primera pista de audio, que es la que debe sonar "todo" al abrir el clip.
-        let mix_stream = mix_audio
-            .as_ref()
-            .map(|t| add_aac_passthrough_stream(&writer, t))
-            .transpose()?;
+        // Sys se declara primero para que sea la pista de audio por defecto.
         let sys_stream = sys_audio
             .as_ref()
             .map(|t| add_aac_passthrough_stream(&writer, t))
@@ -2643,9 +2653,6 @@ mod win {
             }
         }
 
-        if let (Some(stream), Some(track)) = (mix_stream, &mix_audio) {
-            write_audio_track(&writer, stream, track, base)?;
-        }
         if let (Some(stream), Some(track)) = (sys_stream, &sys_audio) {
             write_audio_track(&writer, stream, track, base)?;
         }
@@ -2900,6 +2907,36 @@ mod win {
             0
         } else {
             10_000_000 / fps as i64
+        }
+    }
+
+    // PTS absoluto (en unidades de 100 ns) del slot CFR `n` a `fps`. No acumulado:
+    // se calcula sobre el índice del slot para que no haya deriva aunque 10⁷/fps no sea
+    // entero (60 → 166666/166667 alternando, media exacta). La duración del sample n es
+    // cfr_pts(n+1) - cfr_pts(n). Es la cadencia constante que sustituye a los timestamps
+    // irregulares de WGC: emitimos un frame por slot, duplicando el último si no llegó uno.
+    fn cfr_pts(slot: i64, fps: u32) -> i64 {
+        if fps == 0 {
+            0
+        } else {
+            (slot * 10_000_000) / fps as i64
+        }
+    }
+
+    // La cadencia CFR se apoya en sleeps por debajo del periodo de frame (hasta ~4 ms a
+    // 240 fps). La resolución por defecto del timer de Windows (~15 ms) los volvería muy
+    // imprecisos, así que subimos la resolución a 1 ms mientras dura la captura y la
+    // restauramos al salir. Es la práctica estándar en apps multimedia.
+    struct TimerRes;
+    impl TimerRes {
+        fn new() -> Self {
+            unsafe { timeBeginPeriod(1) };
+            TimerRes
+        }
+    }
+    impl Drop for TimerRes {
+        fn drop(&mut self) {
+            unsafe { timeEndPeriod(1) };
         }
     }
 

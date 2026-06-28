@@ -40,7 +40,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/clips/*", "$APPDATA/thumbs/*"]
+        "scope": ["$APPDATA/clips/*", "$APPDATA/thumbs/*", "$APPDATA/audio/*", "$APPDATA/screenshots/*"]
       }
     }
   },

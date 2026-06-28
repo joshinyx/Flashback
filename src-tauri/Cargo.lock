@@ -994,6 +994,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "time",
+ "tokio",
  "urlencoding",
  "windows",
 ]

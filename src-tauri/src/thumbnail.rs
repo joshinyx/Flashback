@@ -4,11 +4,16 @@
 // y WIC lo codifica a JPEG. Sin dependencias externas.
 
 #[cfg(target_os = "windows")]
-pub use win::generate;
+pub use win::{capture, generate};
 
 #[cfg(not(target_os = "windows"))]
 pub fn generate(_src: String, _dst: String, _max_w: u32) -> Result<(), String> {
     Err("Las miniaturas solo están disponibles en Windows".into())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture(_src: String, _dst: String, _time_ms: f64) -> Result<(), String> {
+    Err("Las capturas solo están disponibles en Windows".into())
 }
 
 #[cfg(target_os = "windows")]
@@ -17,12 +22,12 @@ mod win {
 
     use windows::core::{GUID, HSTRING};
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_WICPixelFormat24bppBGR,
-        GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameEncode, IWICImagingFactory,
-        WICBitmapEncoderNoCache,
+        CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng,
+        GUID_WICPixelFormat24bppBGR, GUID_WICPixelFormat32bppBGRA, IWICBitmapFrameEncode,
+        IWICImagingFactory, WICBitmapEncoderNoCache,
     };
     use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
+    use windows::Win32::System::Com::StructuredStorage::{IPropertyBag2, PROPVARIANT};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
     };
@@ -46,7 +51,7 @@ mod win {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
             ensure_mf();
-            let r = run(&src, &dst, max_w).map_err(|e| format!("{e:?}"));
+            let r = run(&src, &dst, max_w, -1, &GUID_ContainerFormatJpeg).map_err(|e| format!("{e:?}"));
             unsafe { CoUninitialize() };
             r
         })
@@ -54,7 +59,24 @@ mod win {
         .map_err(|_| "El hilo de miniatura terminó inesperadamente".to_string())?
     }
 
-    fn run(src: &str, dst: &str, max_w: u32) -> windows::core::Result<()> {
+    // Captura del fotograma mostrado: igual que la miniatura pero a resolución nativa (max_w 0) y
+    // con el lector posicionado en el tiempo pedido.
+    pub fn capture(src: String, dst: String, time_ms: f64) -> std::result::Result<(), String> {
+        let seek_hns = (time_ms.max(0.0) * 10_000.0) as i64;
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+            ensure_mf();
+            let r = run(&src, &dst, 0, seek_hns, &GUID_ContainerFormatPng).map_err(|e| format!("{e:?}"));
+            unsafe { CoUninitialize() };
+            r
+        })
+        .join()
+        .map_err(|_| "El hilo de captura terminó inesperadamente".to_string())?
+    }
+
+    fn run(src: &str, dst: &str, max_w: u32, seek_hns: i64, container: &GUID) -> windows::core::Result<()> {
         // El SourceReader con procesamiento de vídeo avanzado puede entregar el frame ya
         // convertido a RGB32 y escalado al tamaño pedido, sin pasos manuales de color/escala.
         let mut attrs: Option<IMFAttributes> = None;
@@ -86,6 +108,13 @@ mod win {
         let aw = ((asize >> 32) as u32).max(1);
         let ah = ((asize & 0xFFFF_FFFF) as u32).max(1);
         let ds = unsafe { actual.GetUINT32(&MF_MT_DEFAULT_STRIDE) }.unwrap_or(0) as i32;
+
+        // Captura del frame actual: posicionar el lector en el tiempo pedido (unidades de 100ns,
+        // formato GUID_NULL) antes de leer. seek_hns < 0 = primer frame (miniatura).
+        if seek_hns >= 0 {
+            let pos = PROPVARIANT::from(seek_hns);
+            unsafe { reader.SetCurrentPosition(&GUID::zeroed(), &pos)? };
+        }
 
         // Primer frame con datos (algunos contenedores entregan muestras vacías al inicio).
         let mut frame = None;
@@ -141,15 +170,16 @@ mod win {
         }
         unsafe { buf.Unlock()? };
 
-        encode_jpeg(dst, aw, ah, dst_stride as u32, &packed)
+        encode_image(dst, aw, ah, dst_stride as u32, &packed, container)
     }
 
-    fn encode_jpeg(
+    fn encode_image(
         dst: &str,
         w: u32,
         h: u32,
         stride: u32,
         pixels: &[u8],
+        container: &GUID,
     ) -> windows::core::Result<()> {
         let factory: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
@@ -157,7 +187,7 @@ mod win {
         let stream = unsafe { factory.CreateStream()? };
         unsafe { stream.InitializeFromFilename(&HSTRING::from(dst), GENERIC_WRITE)? };
 
-        let encoder = unsafe { factory.CreateEncoder(&GUID_ContainerFormatJpeg, std::ptr::null())? };
+        let encoder = unsafe { factory.CreateEncoder(container, std::ptr::null())? };
         unsafe { encoder.Initialize(&stream, WICBitmapEncoderNoCache)? };
 
         let mut frame: Option<IWICBitmapFrameEncode> = None;

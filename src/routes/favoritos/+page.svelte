@@ -3,6 +3,7 @@
   import ClipCard from '$lib/components/ClipCard.svelte';
   import { groupClips } from '$lib/clips';
   import { library, refreshLibrary, isFavorite } from '$lib/library.svelte';
+  import { clipOrder } from '$lib/editor.svelte';
 
   $effect(() => {
     refreshLibrary();
@@ -10,6 +11,11 @@
 
   const favs = $derived(library.clips.filter((c) => isFavorite(c.id)));
   const groups = $derived(groupClips(favs));
+
+  // El editor navega anterior/siguiente por este mismo orden (grupos aplanados).
+  $effect(() => {
+    clipOrder.list = groups.flatMap((g) => g.clips);
+  });
 </script>
 
 <div class="favs">

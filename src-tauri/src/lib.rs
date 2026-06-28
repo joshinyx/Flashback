@@ -121,8 +121,16 @@ fn replay_active() -> bool {
 }
 
 #[tauri::command]
-fn prepare_clip_audio(path: String) -> Result<editor::ClipAudio, String> {
-    editor::prepare_clip_audio(path)
+async fn prepare_clip_audio(app: tauri::AppHandle, path: String) -> Result<editor::ClipAudio, String> {
+    use tauri::Manager;
+    let audio_dir = app.path().app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("audio");
+    std::fs::create_dir_all(&audio_dir).map_err(|e| e.to_string())?;
+    let audio_dir = audio_dir.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || editor::prepare_clip_audio(path, audio_dir))
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
@@ -136,40 +144,77 @@ fn save_clip_edit(path: String, edit: editor::ClipEdit) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn keyframe_times(path: String) -> Result<Vec<f64>, String> {
-    editor::keyframe_times(path)
+async fn keyframe_times(path: String) -> Result<Vec<f64>, String> {
+    tokio::task::spawn_blocking(move || editor::keyframe_times(path))
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
-fn clip_fps(path: String) -> Result<u32, String> {
-    editor::clip_fps(path)
+async fn frame_times(path: String) -> Result<Vec<f64>, String> {
+    tokio::task::spawn_blocking(move || editor::frame_times(path))
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
-fn export_clip(src: String, dst: String, edit: editor::ClipEdit) -> Result<(), String> {
-    editor::export_clip(src, dst, edit)
+async fn clip_fps(path: String) -> Result<u32, String> {
+    tokio::task::spawn_blocking(move || editor::clip_fps(path))
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
-fn clip_thumbnail(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    use std::hash::{Hash, Hasher};
+async fn export_clip(src: String, dst: String, edit: editor::ClipEdit) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || editor::export_clip(src, dst, edit))
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
+}
+
+#[tauri::command]
+async fn clip_thumbnail(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("thumbs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let thumb_path = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut h);
+        let dst = dir.join(format!("{:016x}.jpg", h.finish()));
+        let ready = dst.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if !ready {
+            thumbnail::generate(path, dst.to_string_lossy().into_owned(), 0)?;
+        }
+        Ok(dst.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| format!("Error interno: {e}"))?;
+    thumb_path
+}
+
+#[tauri::command]
+async fn capture_frame(app: tauri::AppHandle, path: String, time_ms: f64) -> Result<String, String> {
     use tauri::Manager;
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
-        .join("thumbs");
+        .join("screenshots");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    let dst = dir.join(format!("{:016x}.jpg", h.finish()));
-    let ready = dst.metadata().map(|m| m.len() > 0).unwrap_or(false);
-    if !ready {
-        // max_w = 0: miniatura a la resolución nativa del clip (la carátula se muestra a la
-        // máxima calidad y empareja con el vídeo en el hover).
-        thumbnail::generate(path, dst.to_string_lossy().into_owned(), 0)?;
-    }
-    Ok(dst.to_string_lossy().into_owned())
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("clip");
+        let dst = dir
+            .join(format!("{stem}_{}.png", time_ms.max(0.0).round() as i64))
+            .to_string_lossy()
+            .into_owned();
+        thumbnail::capture(path.clone(), dst.clone(), time_ms)?;
+        Ok(dst)
+    })
+    .await
+    .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
@@ -333,8 +378,10 @@ pub fn run() {
             load_clip_edit,
             save_clip_edit,
             keyframe_times,
+            frame_times,
             clip_fps,
             clip_thumbnail,
+            capture_frame,
             export_clip,
             rename_clip,
             delete_clip,

@@ -168,6 +168,15 @@
     openRow = null;
   }
 
+  // Desactiva el menú contextual nativo de WebView2 (atrás, recargar, guardar como, imprimir…) en
+  // toda la app. Se respeta en campos de texto para no perder copiar/pegar; el editor monta su
+  // propio menú en los bloques (que llama a preventDefault antes de llegar aquí).
+  function onContextMenu(e: MouseEvent) {
+    const t = e.target as HTMLElement | null;
+    if (t?.closest('input, textarea, [contenteditable="true"]')) return;
+    e.preventDefault();
+  }
+
   function toggleMicDD(e: MouseEvent) {
     e.stopPropagation();
     micDDOpen = !micDDOpen;
@@ -401,7 +410,7 @@
   });
 </script>
 
-<svelte:window onclick={closeAll} />
+<svelte:window onclick={closeAll} oncontextmenu={onContextMenu} />
 
 <div class="app">
   <aside class="sidebar" data-tauri-drag-region>
@@ -653,7 +662,7 @@
         <div class="quick">
           <span class="pill combo recpill mono" class:on={recording}>
             <button class="seg rec-seg" onclick={toggleRecording}>
-              <span class="rec-ico"><Icon name={recording ? 'stop' : 'play'} size={18} /></span>
+              <span class="rec-ico"><Icon name={recording ? 'stop' : 'play'} size={15} /></span>
               <span class="rec-label">{recording ? 'Detener grabación' : 'Iniciar grabación'}</span>
             </button>
             <span class="sep">|</span>

@@ -10,11 +10,17 @@
     removeSegment,
     selectSegment,
     trimSegment,
-    reorderSegment,
+    sortSegmentsByPos,
     persistEdit,
+    captureFrame,
+    navigateClip,
+    clipOrder,
+    type Segment,
   } from '$lib/editor.svelte';
   import { formatSize } from '$lib/clips';
   import { refreshLibrary } from '$lib/library.svelte';
+  import { revealItemInDir } from '@tauri-apps/plugin-opener';
+  import { convertFileSrc } from '@tauri-apps/api/core';
 
   let video = $state<HTMLVideoElement | null>(null);
   let sysAudio = $state<HTMLAudioElement | null>(null);
@@ -33,9 +39,43 @@
   type Drag =
     | { kind: 'seek' }
     | { kind: 'trim'; index: number; edge: 'start' | 'end'; downX: number; origStart: number; origEnd: number }
-    | { kind: 'move'; index: number; downX: number; moved: boolean };
+    | { kind: 'vol'; chan: 'sys' | 'mic'; rect: DOMRect };
   let drag: Drag | null = null;
   let scrubbing = $state(false);
+  // Activo mientras se recorta un borde: desactiva la transición de `left` de los bloques para que,
+  // al arrastrar el inicio, el borde izquierdo siga al cursor al instante (la animación lo hacía
+  // flotar). El final solo cambia `width`, que no tiene transición, por eso ya iba fino.
+  let trimming = $state(false);
+  // Canal cuyo fader se arrastra (para mostrar su burbuja de % mientras dura el gesto). Alto del
+  // pulgar del fader: el cursor controla su centro, así que se descuenta del recorrido útil.
+  let volActive = $state<'sys' | 'mic' | null>(null);
+  const VOL_THUMB = 20;
+
+  // Burbuja de % flotante (position: fixed a nivel del overlay) para que el overflow de la timeline
+  // no la recorte. Se posiciona sobre el pulgar del fader activo (al pasar el ratón o arrastrar).
+  let bubble = $state<{ x: number; y: number; pct: number } | null>(null);
+
+  // Arrastrar-para-reordenar: tras mantener pulsado un bloque LIFT_MS, se "levanta" (escala) y
+  // sigue al cursor; al acercar su borde a menos de SNAP_MS de un hueco entre bloques, se cuela
+  // ahí (imán). Si el puntero se mueve antes de levantarse, el gesto se trata como scrub.
+  const LIFT_MS = 300;
+  const LIFT_SCALE = 1.05;
+  const SNAP_MS = 200;
+  const LIFT_CANCEL_PX = 6;
+  let liftTimer: ReturnType<typeof setTimeout> | null = null;
+  let liftPending: { downX: number } | null = null;
+  // index = bloque arrastrado; grabMs = desfase (ms de la base) entre su borde izquierdo y donde
+  // se agarró. Mientras se arrastra se mueve su `posMs` directamente.
+  let lift = $state<{ index: number; grabMs: number } | null>(null);
+
+  // Zoom de la timeline (Ctrl + rueda). 1 = el clip completo cabe; al ampliar aparece scroll
+  // horizontal para precisión fina. No es infinito.
+  const ZOOM_MIN = 0.5;
+  const ZOOM_MAX = 40;
+  let zoom = $state(1);
+
+  // Menú contextual (clic derecho) sobre un bloque: desactivar/activar o eliminar.
+  let blockMenu = $state<{ x: number; y: number; index: number } | null>(null);
 
   let overlayEl = $state<HTMLDivElement | null>(null);
   let dockEl = $state<HTMLDivElement | null>(null);
@@ -46,54 +86,50 @@
 
   let sysCanvas = $state<HTMLCanvasElement | null>(null);
   let micCanvas = $state<HTMLCanvasElement | null>(null);
-  let sysPeaks = $state<number[] | null>(null);
-  let micPeaks = $state<number[] | null>(null);
-  let analyzing = $state(false);
+  let mixCanvas = $state<HTMLCanvasElement | null>(null);
 
   const SYS_HUE = '#6f93f9';
   const SYS_DIM = 'rgba(111, 147, 249, 0.16)';
   const MIC_HUE = '#f4c95d';
   const MIC_DIM = 'rgba(244, 201, 93, 0.16)';
-
-  let audioCtx: AudioContext | null = null;
+  const MIX_HUE = '#8b93a7';
+  const MIX_DIM = 'rgba(139, 147, 167, 0.16)';
 
   const FRAME_MS = $derived(1000 / (editorState.fps || 30));
   const hasSeparate = $derived(!!(editorState.system || editorState.mic));
 
-  // Duración total de salida = suma de las duraciones de cada bloque (sin huecos).
-  const kept = $derived(editorState.segments.reduce((a, s) => a + (s.endMs - s.startMs), 0));
-  const frac = $derived(kept > 0 ? outPos / kept : 0);
+  // Navegación entre clips (anterior/siguiente) por el orden visible de la rejilla.
+  const navIdx = $derived(clipOrder.list.findIndex((c) => c.id === editorState.clip?.id));
+  const hasPrev = $derived(navIdx > 0);
+  const hasNext = $derived(navIdx >= 0 && navIdx < clipOrder.list.length - 1);
+  // Alto de la card del mezclador: fijo (el de micrófono + sistema) aunque solo haya sistema, para
+  // que no encoja. 53 = lane de vídeo (46 + gap 7); 107 = dos lanes de audio (50 + 50 + gap 7);
+  // +40 = 20px extra por arriba y 20 por abajo (la elevación sube otros 20 en el CSS).
+  const mixerH = 53 + 40 + 107;
+
+  // La base de la timeline es estática: su ancho (a escala fija) representa la duración original
+  // del clip. Cada sección se dibuja en su posición libre `posMs`; el espacio sin sección queda
+  // en negro. La exportación une las secciones sin huecos.
+  const total = $derived(editorState.durationMs);
+  // Duración de salida = suma de las duraciones conservadas (lo que dura el clip exportado).
+  const kept = $derived(editorState.segments.reduce((a, s) => a + (s.disabled ? 0 : s.endMs - s.startMs), 0));
+  // Posición del cursor sobre la base = posición en el editor (posMs) del tramo que se muestra.
+  const frac = $derived.by(() => {
+    if (total <= 0) return 0;
+    const { index, srcMs } = outToSeg(outPos);
+    const seg = editorState.segments[index];
+    if (!seg) return 0;
+    return (seg.posMs + (srcMs - seg.startMs)) / total;
+  });
 
   const segView = $derived.by(() => {
-    if (kept <= 0) return [] as { left: number; width: number; startMs: number; endMs: number }[];
-    let acc = 0;
-    const out = [];
-    for (const s of editorState.segments) {
-      const d = s.endMs - s.startMs;
-      out.push({ left: (acc / kept) * 100, width: (d / kept) * 100, startMs: s.startMs, endMs: s.endMs });
-      acc += d;
-    }
-    return out;
-  });
-
-  const activeInfo = $derived.by(() => {
-    const s = editorState.segments[editorState.activeSegment];
-    if (!s) return null;
-    return {
-      n: editorState.activeSegment + 1,
-      total: editorState.segments.length,
-      start: s.startMs,
-      end: s.endMs,
-      dur: s.endMs - s.startMs,
-    };
-  });
-
-  const ticks = $derived.by(() => {
-    if (kept <= 0) return [] as { frac: number; label: string }[];
-    const count = 6;
-    return Array.from({ length: count + 1 }, (_, i) => ({
-      frac: i / count,
-      label: fmtClock((kept * i) / count / 1000),
+    if (total <= 0) return [] as { seg: Segment; index: number; left: number; width: number }[];
+    const z = Math.min(1, zoom);
+    return editorState.segments.map((seg, i) => ({
+      seg,
+      index: i,
+      left: (seg.posMs / total) * z * 100,
+      width: ((seg.endMs - seg.startMs) / total) * z * 100,
     }));
   });
 
@@ -102,40 +138,69 @@
     if (!isFinite(sec) || sec < 0) sec = 0;
     return `${two(sec / 60)}:${two(sec % 60)}.${two((sec * 100) % 100)}`;
   }
-  function fmtClock(sec: number): string {
-    if (!isFinite(sec) || sec < 0) sec = 0;
-    return `${Math.floor(sec / 60)}:${two(sec % 60)}`;
-  }
-
   // ---- mapeo salida <-> origen ----
   function cumStartOf(i: number): number {
     const segs = editorState.segments;
     let a = 0;
-    for (let k = 0; k < i && k < segs.length; k++) a += segs[k].endMs - segs[k].startMs;
+    for (let k = 0; k < i && k < segs.length; k++) {
+      if (!segs[k].disabled) a += segs[k].endMs - segs[k].startMs;
+    }
     return a;
   }
+  // Mapea tiempo de salida -> (índice de bloque, ms de origen) recorriendo solo bloques activos;
+  // los desactivados se saltan como si no existieran.
   function outToSeg(T: number): { index: number; srcMs: number } {
     const segs = editorState.segments;
     let a = 0;
+    let last = -1;
     for (let i = 0; i < segs.length; i++) {
+      if (segs[i].disabled) continue;
+      last = i;
       const d = segs[i].endMs - segs[i].startMs;
-      if (T < a + d || i === segs.length - 1) {
+      if (T < a + d) {
         return { index: i, srcMs: segs[i].startMs + Math.max(0, Math.min(T - a, d)) };
       }
       a += d;
     }
+    if (last >= 0) return { index: last, srcMs: segs[last].endMs };
     return { index: 0, srcMs: segs[0]?.startMs ?? 0 };
   }
+  // Traduce una posición horizontal sobre la base (posición de editor, posMs) a tiempo de salida.
+  // Si cae en un hueco negro, engancha al borde de sección más cercano.
   function outFromClientX(clientX: number): number {
-    if (!laneEl || kept <= 0) return 0;
+    const segs = editorState.segments;
+    if (!laneEl || total <= 0 || segs.length === 0) return 0;
     const r = laneEl.getBoundingClientRect();
     const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
-    return f * kept;
+    const editorMs = f * total / Math.min(1, zoom || 1);
+    let cum = 0;
+    let bestT = 0;
+    let bestDist = Infinity;
+    for (const s of segs) {
+      if (s.disabled) continue;
+      const d = s.endMs - s.startMs;
+      if (editorMs >= s.posMs && editorMs <= s.posMs + d) return cum + (editorMs - s.posMs);
+      const dStart = Math.abs(editorMs - s.posMs);
+      if (dStart < bestDist) { bestDist = dStart; bestT = cum; }
+      const dEnd = Math.abs(editorMs - (s.posMs + d));
+      if (dEnd < bestDist) { bestDist = dEnd; bestT = cum + d; }
+      cum += d;
+    }
+    return bestT;
   }
 
   // ---- audio sync ----
   function applyAudio() {
-    if (video) video.muted = hasSeparate;
+    if (video) {
+      if (hasSeparate) {
+        // Las pistas separadas suenan por los <audio>; el vídeo va en silencio.
+        video.muted = true;
+      } else {
+        // Pista única embebida: el fader de headphones controla el audio del propio vídeo.
+        video.muted = editorState.mixer.sys_muted;
+        video.volume = editorState.mixer.sys_vol;
+      }
+    }
     if (sysAudio) sysAudio.volume = editorState.mixer.sys_muted ? 0 : editorState.mixer.sys_vol;
     if (micAudio) micAudio.volume = editorState.mixer.mic_muted ? 0 : editorState.mixer.mic_vol;
   }
@@ -155,7 +220,10 @@
     applyAudio();
   });
 
-  $effect(() => () => cancelAnimationFrame(raf));
+  $effect(() => () => {
+    cancelAnimationFrame(raf);
+    clearLiftTimer();
+  });
 
   function seekSource(srcMs: number) {
     if (!video) return;
@@ -174,6 +242,11 @@
     seekSource(srcMs);
   }
 
+  // Margen para considerar dos bloques "pegados" en el origen. Un corte que no quita nada deja
+  // next.startMs == seg.endMs: en ese caso NO se hace seek, porque fijar video.currentTime vacía
+  // el decoder y provoca el microcorte. Solo se salta cuando hay un hueco real entre bloques.
+  const SEAM_MS = 12;
+
   function tick() {
     if (!video || !playing) return;
     const segs = editorState.segments;
@@ -183,10 +256,19 @@
       return;
     }
     const srcMs = video.currentTime * 1000;
+    // drift correction for audio elements
+    for (const a of [sysAudio, micAudio]) {
+      if (a && Math.abs(a.currentTime - video.currentTime) > 0.12) a.currentTime = video.currentTime;
+    }
     if (srcMs >= seg.endMs - 1) {
-      if (playIndex < segs.length - 1) {
-        playIndex++;
-        seekSource(segs[playIndex].startMs);
+      let ni = playIndex + 1;
+      while (ni < segs.length && segs[ni].disabled) ni++;
+      if (ni < segs.length) {
+        const next = segs[ni];
+        playIndex = ni;
+        if (Math.abs(next.startMs - seg.endMs) > SEAM_MS) {
+          seekSource(next.startMs);
+        }
         outPos = cumStartOf(playIndex);
       } else {
         pause();
@@ -195,9 +277,6 @@
       }
     } else {
       outPos = cumStartOf(playIndex) + Math.max(0, srcMs - seg.startMs);
-      for (const a of [sysAudio, micAudio]) {
-        if (a && Math.abs(a.currentTime - video.currentTime) > 0.12) a.currentTime = video.currentTime;
-      }
     }
     raf = requestAnimationFrame(tick);
   }
@@ -207,12 +286,13 @@
     seekOutput(outPos >= kept ? 0 : outPos);
     try {
       await video.play();
+      sysAudio?.play().catch(() => {});
+      micAudio?.play().catch(() => {});
     } catch (e) {
       console.error('editor play', e);
       return;
     }
-    sysAudio?.play().catch(() => {});
-    micAudio?.play().catch(() => {});
+
     playing = true;
     cancelAnimationFrame(raf);
     raf = requestAnimationFrame(tick);
@@ -235,7 +315,7 @@
     const dMs = (video?.duration || 0) * 1000;
     editorState.durationMs = dMs;
     if (editorState.segments.length === 0) {
-      editorState.segments = [{ startMs: 0, endMs: dMs }];
+      editorState.segments = [{ startMs: 0, endMs: dMs, posMs: 0, boundStartMs: 0, boundEndMs: dMs, disabled: false }];
       editorState.activeSegment = 0;
     }
     playIndex = 0;
@@ -244,8 +324,40 @@
     applyAudio();
   }
 
+  // Índice del fotograma mostrado en `srcMs`: el último cuyo PTS <= srcMs (búsqueda binaria).
+  function frameIndexAt(ft: number[], srcMs: number): number {
+    let lo = 0, hi = ft.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (ft[mid] <= srcMs + 1e-3) { ans = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return ans;
+  }
+
+  // Avanza/retrocede exactamente un fotograma. El clip es de framerate variable (captura WGC), así
+  // que se usan los timestamps reales (editorState.frameTimes): se salta al frame contiguo de la
+  // tabla y se cae un poco DENTRO de él (no en su borde) para que el decoder muestre justo ese y el
+  // paso sea constante 1·1·1. Sin tabla, fallback al paso aproximado por FRAME_MS.
   function stepFrame(dir: number) {
-    seekOutput(outPos + dir * FRAME_MS);
+    const ft = editorState.frameTimes;
+    const { index, srcMs } = outToSeg(outPos);
+    const seg = editorState.segments[index];
+    if (!seg) return;
+    if (ft.length < 2) {
+      seekOutput(outPos + dir * FRAME_MS);
+      return;
+    }
+    const k = Math.max(0, frameIndexAt(ft, srcMs));
+    const tk = Math.max(0, Math.min(ft.length - 1, k + dir));
+    const next = tk + 1 < ft.length ? ft[tk + 1] : ft[tk] + FRAME_MS;
+    const target = ft[tk] + Math.min(1.5, (next - ft[tk]) * 0.25);
+    if (target >= seg.startMs && target < seg.endMs) {
+      seekOutput(cumStartOf(index) + (target - seg.startMs));
+    } else {
+      // Cruza el borde del segmento: el mapeo global lleva al frame contiguo del montaje.
+      seekOutput(outPos + dir * FRAME_MS);
+    }
   }
 
   function cut() {
@@ -269,7 +381,121 @@
     if (e.button !== 0) return;
     e.stopPropagation();
     selectSegment(i);
-    drag = { kind: 'move', index: i, downX: e.clientX, moved: false };
+    drag = { kind: 'seek' };
+    seekOutput(outFromClientX(e.clientX));
+
+    // Mantener pulsado sin mover LIFT_MS levanta el bloque para reordenar. Solo tiene sentido
+    // si hay más de un bloque; con uno solo, el gesto se queda en simple scrub.
+    clearLiftTimer();
+    lift = null;
+    if (editorState.segments.length > 1) {
+      const downX = e.clientX;
+      liftPending = { downX };
+      liftTimer = setTimeout(() => {
+        liftTimer = null;
+        const seg = editorState.segments[i];
+        const r = laneEl?.getBoundingClientRect();
+        if (!seg || !r || total <= 0) return;
+        const pointerMs = ((downX - r.left) / r.width) * total / Math.min(1, zoom || 1);
+        lift = { index: i, grabMs: pointerMs - seg.posMs };
+        drag = null;
+      }, LIFT_MS);
+    }
+  }
+
+  function clearLiftTimer() {
+    if (liftTimer) {
+      clearTimeout(liftTimer);
+      liftTimer = null;
+    }
+  }
+
+  function onBlockContext(e: MouseEvent, i: number) {
+    e.preventDefault();
+    e.stopPropagation();
+    clearLiftTimer();
+    liftPending = null;
+    lift = null;
+    drag = null;
+    selectSegment(i);
+    const mw = 170;
+    const mh = 84;
+    const x = Math.min(e.clientX, window.innerWidth - mw - 8);
+    const y = Math.min(e.clientY, window.innerHeight - mh - 8);
+    blockMenu = { x, y, index: i };
+  }
+
+  function closeBlockMenu() {
+    blockMenu = null;
+  }
+
+  function toggleDisableBlock() {
+    const i = blockMenu?.index;
+    closeBlockMenu();
+    if (i == null) return;
+    const seg = editorState.segments[i];
+    if (!seg) return;
+    // Desactivar el bloque que se reproduce dejaría el playhead dentro de un tramo ya ignorado;
+    // se pausa y se reengancha al tiempo de salida válido más cercano.
+    pause();
+    seg.disabled = !seg.disabled;
+    markEdited();
+    seekOutput(Math.min(outPos, kept));
+  }
+
+  function deleteBlock() {
+    const i = blockMenu?.index;
+    closeBlockMenu();
+    if (i == null) return;
+    removeSegment(i);
+    seekOutput(Math.min(outPos, kept));
+  }
+
+  // Mueve la sección levantada siguiendo al cursor dentro del espacio negro libre (sin solaparse
+  // con otras). Si un borde queda a menos de SNAP_MS de un hueco vecino (o del inicio/fin), se
+  // pega ahí (imán). Lo que quede sin sección es negro; al exportar desaparece.
+  function updateLift(clientX: number) {
+    if (!lift || !laneEl || total <= 0) return;
+    const segs = editorState.segments;
+    const cur = segs[lift.index];
+    if (!cur) return;
+    const dur = cur.endMs - cur.startMs;
+    const r = laneEl.getBoundingClientRect();
+    const pointerMs = Math.max(0, ((clientX - r.left) / r.width) * total / Math.min(1, zoom || 1));
+    const desired = pointerMs - lift.grabMs;
+
+    // Huecos libres entre las demás secciones, dentro de [0, total].
+    const occ = segs
+      .filter((_, idx) => idx !== lift!.index)
+      .map((s) => ({ a: s.posMs, b: s.posMs + (s.endMs - s.startMs) }))
+      .sort((x, y) => x.a - y.a);
+    const gaps: [number, number][] = [];
+    let cursor = 0;
+    for (const o of occ) {
+      if (o.a - cursor > 0.5) gaps.push([cursor, o.a]);
+      cursor = Math.max(cursor, o.b);
+    }
+    // espacio a la derecha para soltar bloques más allá del video
+    const rightExtent = total / Math.min(1, zoom || 1);
+    gaps.push([cursor, rightExtent]);
+
+    // Hueco que admite la sección y queda más cerca del punto deseado.
+    let best: { pos: number; lo: number; hi: number } | null = null;
+    let bestDist = Infinity;
+    for (const [gs, ge] of gaps) {
+      if (ge - gs < dur - 0.5) continue;
+      const lo = gs;
+      const hi = ge - dur;
+      const pos = Math.max(lo, Math.min(desired, hi));
+      const dist = Math.abs(pos - desired);
+      if (dist < bestDist) { bestDist = dist; best = { pos, lo, hi }; }
+    }
+    if (!best) return;
+
+    let pos = best.pos;
+    if (Math.abs(pos - best.lo) <= SNAP_MS) pos = best.lo;
+    else if (Math.abs(pos - best.hi) <= SNAP_MS) pos = best.hi;
+    cur.posMs = pos;
   }
 
   function onGripDown(e: MouseEvent, i: number, edge: 'start' | 'end') {
@@ -279,6 +505,7 @@
     selectSegment(i);
     const s = editorState.segments[i];
     drag = { kind: 'trim', index: i, edge, downX: e.clientX, origStart: s.startMs, origEnd: s.endMs };
+    trimming = true;
   }
 
   function onKnobDown(e: MouseEvent) {
@@ -289,10 +516,86 @@
     drag = { kind: 'seek' };
   }
 
+  // ---- faders de volumen ----
+  // Sitúa la burbuja (en coordenadas de viewport, para position: fixed) centrada sobre el pulgar.
+  function placeBubble(rect: DOMRect, v: number) {
+    const thumbCenterY = rect.bottom - (v * (rect.height - VOL_THUMB) + VOL_THUMB / 2);
+    bubble = {
+      x: rect.left + rect.width / 2,
+      y: thumbCenterY - VOL_THUMB / 2 - 6,
+      pct: Math.round(v * 100),
+    };
+  }
+
+  function volAt(rect: DOMRect, clientY: number): number {
+    const usable = Math.max(1, rect.height - VOL_THUMB);
+    const fromBottom = rect.height - (clientY - rect.top);
+    return Math.max(0, Math.min(1, (fromBottom - VOL_THUMB / 2) / usable));
+  }
+
+  function setVol(chan: 'sys' | 'mic', clientY: number, rect: DOMRect) {
+    const v = volAt(rect, clientY);
+    if (chan === 'sys') editorState.mixer.sys_vol = v;
+    else editorState.mixer.mic_vol = v;
+    markEdited();
+    placeBubble(rect, v);
+  }
+
+  function onFaderDown(e: MouseEvent, chan: 'sys' | 'mic') {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    drag = { kind: 'vol', chan, rect };
+    volActive = chan;
+    setVol(chan, e.clientY, rect);
+  }
+
+  // Al pasar el ratón sin arrastrar, muestra la burbuja en la posición actual del fader.
+  function onFaderHover(e: MouseEvent, chan: 'sys' | 'mic') {
+    if (volActive) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    placeBubble(rect, chan === 'sys' ? editorState.mixer.sys_vol : editorState.mixer.mic_vol);
+  }
+
+  function onFaderLeave() {
+    if (!volActive) bubble = null;
+  }
+
+  function onFaderKey(e: KeyboardEvent, chan: 'sys' | 'mic') {
+    const cur = chan === 'sys' ? editorState.mixer.sys_vol : editorState.mixer.mic_vol;
+    let v = cur;
+    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') v = Math.min(1, cur + 0.05);
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') v = Math.max(0, cur - 0.05);
+    else if (e.key === 'Home') v = 0;
+    else if (e.key === 'End') v = 1;
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (chan === 'sys') editorState.mixer.sys_vol = v;
+    else editorState.mixer.mic_vol = v;
+    markEdited();
+  }
+
+  function toggleMute(chan: 'sys' | 'mic') {
+    if (chan === 'sys') editorState.mixer.sys_muted = !editorState.mixer.sys_muted;
+    else editorState.mixer.mic_muted = !editorState.mixer.mic_muted;
+    markEdited();
+  }
+
   function onDockGripDown(e: MouseEvent) {
     if (e.button !== 0) return;
     e.preventDefault();
     dockDrag = { startY: e.clientY, startH: dockEl?.getBoundingClientRect().height ?? 0 };
+  }
+
+  // Ctrl + rueda amplía/reduce la timeline para edición fina al milisegundo; con scroll horizontal
+  // cuando el montaje no cabe. Sin Ctrl, la rueda hace su scroll normal.
+  function onTimelineWheel(e: WheelEvent) {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * factor));
   }
 
   function onWinMove(e: MouseEvent) {
@@ -305,20 +608,24 @@
       dockH = Math.round(Math.max(150, Math.min(next, max)));
       return;
     }
+    if (lift) {
+      updateLift(e.clientX);
+      return;
+    }
+    // Si el puntero se mueve antes de que el bloque se levante, el gesto es un scrub normal.
+    if (liftPending && Math.abs(e.clientX - liftPending.downX) > LIFT_CANCEL_PX) {
+      clearLiftTimer();
+      liftPending = null;
+    }
     if (!drag) return;
     if (drag.kind === 'seek') {
       seekOutput(outFromClientX(e.clientX));
-    } else if (drag.kind === 'move') {
-      if (Math.abs(e.clientX - drag.downX) > 3) drag.moved = true;
-      const tgt = outToSeg(outFromClientX(e.clientX)).index;
-      if (tgt !== drag.index) {
-        reorderSegment(drag.index, tgt);
-        drag.index = tgt;
-      }
+    } else if (drag.kind === 'vol') {
+      setVol(drag.chan, e.clientY, drag.rect);
     } else if (drag.kind === 'trim') {
       const r = laneEl?.getBoundingClientRect();
       if (!r) return;
-      const dms = ((e.clientX - drag.downX) * kept) / r.width;
+      const dms = ((e.clientX - drag.downX) * total) / r.width;
       const val = drag.edge === 'start' ? drag.origStart + dms : drag.origEnd + dms;
       trimSegment(drag.index, drag.edge, val);
       const seg = editorState.segments[drag.index];
@@ -339,9 +646,23 @@
       dockDrag = null;
       return;
     }
-    if (drag && drag.kind === 'move' && !drag.moved) seekOutput(outFromClientX(drag.downX));
+    clearLiftTimer();
+    liftPending = null;
+    if (lift) {
+      // Al soltar, reordena el array por posición (izq→der = orden de salida) y reselecciona la
+      // sección movida por su posMs (único al no solaparse); refresca el fotograma.
+      const droppedPos = editorState.segments[lift.index]?.posMs ?? 0;
+      lift = null;
+      sortSegmentsByPos();
+      const idx = editorState.segments.findIndex((s) => s.posMs === droppedPos);
+      if (idx >= 0) selectSegment(idx);
+      seekOutput(Math.min(outPos, kept));
+    }
     drag = null;
     scrubbing = false;
+    volActive = null;
+    trimming = false;
+    bubble = null;
   }
 
   function toggleFullscreen() {
@@ -357,6 +678,11 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    if (blockMenu) {
+      if (e.key === 'Escape') e.preventDefault();
+      closeBlockMenu();
+      return;
+    }
     if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
     if (e.key === 'Escape') {
       if (document.fullscreenElement) return;
@@ -379,6 +705,29 @@
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
       stepFrame(1);
+    }
+  }
+
+  async function screenshot() {
+    if (!video) return;
+    try {
+      const dst = await captureFrame(video.currentTime * 1000);
+      if (!dst) return;
+      const name = dst.split(/[/\\]/).pop();
+      // Copia automática al portapapeles leyendo el PNG ya guardado (sin canvas, que se "ensucia"
+      // con el protocolo asset). Si falla, la captura igual queda guardada en disco.
+      let copied = false;
+      try {
+        const blob = await (await fetch(convertFileSrc(dst))).blob();
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        copied = true;
+      } catch (err) {
+        console.error('clipboard', err);
+      }
+      setNotice(copied ? `Captura copiada y guardada: ${name}` : `Captura guardada: ${name}`, 4000);
+    } catch (e) {
+      setNotice(`Error al capturar: ${e}`, 5000);
+      console.error('capture', e);
     }
   }
 
@@ -409,49 +758,7 @@
   }
 
   // ---- forma de onda (en orden de salida) ----
-  async function computePeaks(url: string, buckets: number): Promise<number[] | null> {
-    try {
-      const resp = await fetch(url);
-      const arr = await resp.arrayBuffer();
-      audioCtx ??= new AudioContext();
-      const buf = await audioCtx.decodeAudioData(arr);
-      const chs: Float32Array[] = [];
-      for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c));
-      const n = buf.length;
-      const size = Math.max(1, Math.floor(n / buckets));
-      const peaks = new Array(buckets).fill(0);
-      for (let b = 0; b < buckets; b++) {
-        const start = b * size;
-        const end = Math.min(n, start + size);
-        let peak = 0;
-        for (let i = start; i < end; i++) {
-          for (const ch of chs) {
-            const v = Math.abs(ch[i]);
-            if (v > peak) peak = v;
-          }
-        }
-        peaks[b] = peak;
-      }
-      return peaks;
-    } catch (e) {
-      console.error('waveform', e);
-      return null;
-    }
-  }
-
-  $effect(() => {
-    const sys = editorState.system;
-    const mic = editorState.mic;
-    sysPeaks = null;
-    micPeaks = null;
-    if (!sys && !mic) return;
-    analyzing = true;
-    (async () => {
-      if (sys) sysPeaks = await computePeaks(sys, 1600);
-      if (mic) micPeaks = await computePeaks(mic, 1600);
-      analyzing = false;
-    })();
-  });
+  // Los picos llegan ya calculados desde el backend (editorState.*Peaks): aquí solo se dibujan.
 
   $effect(() => {
     const el = bodyEl;
@@ -482,51 +789,51 @@
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
     const dur = editorState.durationMs;
-    if (!peaks || kept <= 0 || dur <= 0) return;
+    if (!peaks || dur <= 0) return;
 
     const mid = h / 2;
     const amp = h * 0.44;
-    ctx.fillStyle = muted ? dim : hue;
-    ctx.beginPath();
-    let acc = 0;
-    for (const s of editorState.segments) {
-      const segdur = s.endMs - s.startMs;
-      const x0 = (acc / kept) * w;
-      const x1 = ((acc + segdur) / kept) * w;
-      for (let x = Math.floor(x0); x < x1; x++) {
-        const f = (x - x0) / Math.max(1e-6, x1 - x0);
-        const srcMs = s.startMs + f * segdur;
-        const b = Math.min(peaks.length - 1, Math.max(0, Math.floor((srcMs / dur) * peaks.length)));
-        const y = Math.max(0.5, peaks[b] * amp);
-        ctx.rect(x, mid - y, 1, y * 2);
-      }
-      acc += segdur;
-    }
-    ctx.fill();
+    const z = Math.min(1, zoom);
 
-    // separadores entre bloques
-    if (editorState.segments.length > 1) {
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-      let a = 0;
-      for (let i = 0; i < editorState.segments.length - 1; i++) {
-        a += editorState.segments[i].endMs - editorState.segments[i].startMs;
-        ctx.fillRect((a / kept) * w - 0.5, 0, 1, h);
+    const paint = (segs: Segment[], color: string) => {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (const s of segs) {
+        const segdur = s.endMs - s.startMs;
+        const x0 = (s.posMs / dur) * z * w;
+        const x1 = ((s.posMs + segdur) / dur) * z * w;
+        for (let x = Math.floor(x0); x < x1; x++) {
+          const f = (x - x0) / Math.max(1e-6, x1 - x0);
+          const srcMs = s.startMs + f * segdur;
+          const b = Math.min(peaks.length - 1, Math.max(0, Math.floor((srcMs / dur) * peaks.length)));
+          const y = Math.max(0.5, Math.min(1, peaks[b] * 1.8) * amp);
+          ctx.rect(x, mid - y, 1, y * 2);
+        }
       }
-    }
+      ctx.fill();
+    };
+    // Los bloques desactivados se pintan siempre atenuados (color dim), como en la timeline.
+    paint(editorState.segments.filter((s) => !s.disabled), muted ? dim : hue);
+    paint(editorState.segments.filter((s) => s.disabled), dim);
   }
 
   $effect(() => {
     void [
       editorState.segments,
       editorState.durationMs,
-      sysPeaks,
-      micPeaks,
+      editorState.sysPeaks,
+      editorState.micPeaks,
+      editorState.mixPeaks,
+      sysCanvas,
+      micCanvas,
+      mixCanvas,
       laneW,
       editorState.mixer.sys_muted,
       editorState.mixer.mic_muted,
     ];
-    renderWave(sysCanvas, sysPeaks, SYS_HUE, SYS_DIM, editorState.mixer.sys_muted);
-    renderWave(micCanvas, micPeaks, MIC_HUE, MIC_DIM, editorState.mixer.mic_muted);
+    renderWave(sysCanvas, editorState.sysPeaks, SYS_HUE, SYS_DIM, editorState.mixer.sys_muted);
+    renderWave(micCanvas, editorState.micPeaks, MIC_HUE, MIC_DIM, editorState.mixer.mic_muted);
+    renderWave(mixCanvas, editorState.mixPeaks, MIX_HUE, MIX_DIM, false);
   });
 
   // ---- sub-bar helpers ----
@@ -536,6 +843,15 @@
       return d.toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' });
     } catch {
       return '';
+    }
+  }
+  async function openLocation() {
+    const p = editorState.clip?.path;
+    if (!p) return;
+    try {
+      await revealItemInDir(p);
+    } catch (err) {
+      console.error('revealItemInDir', err);
     }
   }
   function shortPath(p: string): string {
@@ -552,11 +868,11 @@
   <div class="sub-bar mono">
     <div class="sub-left">
       <div class="sub-chevrons">
-        <button class="sub-btn" aria-label="Clip anterior">
-          <svg width="256" height="256" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        <button class="sub-btn" aria-label="Clip anterior" disabled={!hasPrev || editorState.exporting} onclick={() => navigateClip(-1)}>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="currentColor"><path d="M 896 511.62C 896 531.17 882.83 547.9 864.24 552.88Q 859.03 554.27 847.09 554.27Q 331.65 554.25 274.29 554.25A 0.28 0.27 67.3 0 0 274.1 554.72Q 291.29 571.91 373.18 653.82C 375.44 656.08 378.29 660.47 379.72 663.6Q 388.28 682.4 379.81 700.58C 369.12 723.55 340.54 731.79 318.84 718.64Q 314.43 715.97 304.94 706.35Q 296.52 697.84 140.32 541.69C 132.48 533.85 128 522.66 128 511.61C 128 500.57 132.48 489.38 140.32 481.54Q 296.52 325.39 304.94 316.88Q 314.43 307.26 318.84 304.59C 340.54 291.44 369.12 299.68 379.81 322.65Q 388.28 340.83 379.72 359.63C 378.29 362.76 375.44 367.15 373.18 369.41Q 291.29 451.32 274.1 468.51A 0.28 0.27 -67.3 0 0 274.29 468.98Q 331.65 468.98 847.09 468.96Q 859.03 468.96 864.24 470.35C 882.83 475.33 896 492.06 896 511.62Z"/></svg>
         </button>
-        <button class="sub-btn" aria-label="Clip siguiente">
-          <svg width="256" height="256" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+        <button class="sub-btn" aria-label="Clip siguiente" disabled={!hasNext || editorState.exporting} onclick={() => navigateClip(1)}>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="currentColor"><path d="M 896 511.62C 896 520.05 893.43 528.39 888.82 535.4Q 886.22 539.36 879.43 545.94Q 878.49 546.85 719.95 705.45Q 708.63 716.76 704.04 719.33Q 694.05 724.92 682.46 724.88C 649.56 724.77 629.55 689.32 645.73 660.83Q 648.57 655.83 656.42 648.13Q 665.07 639.64 749.89 554.71A 0.26 0.26 22.15 0 0 749.7 554.27Q 188.43 554.23 177.34 554.3Q 165.13 554.38 159.82 552.91C 141.08 547.71 128 531.28 128 511.61C 128 491.95 141.08 475.52 159.82 470.32Q 165.13 468.85 177.34 468.93Q 188.43 469 749.7 468.96A 0.26 0.26 -22.15 0 0 749.89 468.52Q 665.07 383.59 656.42 375.1Q 648.57 367.4 645.73 362.4C 629.55 333.91 649.56 298.46 682.46 298.35Q 694.05 298.31 704.04 303.9Q 708.63 306.47 719.95 317.78Q 878.49 476.38 879.43 477.29Q 886.22 483.87 888.82 487.83C 893.43 494.84 896 503.18 896 511.62Z"/></svg>
         </button>
       </div>
       <span class="sub-sep">|</span>
@@ -567,9 +883,17 @@
       <span class="sub-info">{formatSize(editorState.clip?.sizeBytes ?? 0)}</span>
       <span class="sub-sep">|</span>
       <span class="sub-label">Ruta:</span>
-      <span class="sub-path">{shortPath(editorState.clip?.path ?? '')}</span>
+      <button
+        class="sub-path"
+        onclick={openLocation}
+        title={editorState.clip?.path ?? ''}
+        disabled={!editorState.clip?.path}
+      >{shortPath(editorState.clip?.path ?? '')}</button>
     </div>
-    <button class="sub-close" aria-label="Cerrar editor" onclick={close}>✕</button>
+    <div class="sub-right">
+      <button class="sub-reset" onclick={resetTrim}>Reestablecer</button>
+      <button class="sub-close" aria-label="Cerrar editor" onclick={close}>✕</button>
+    </div>
   </div>
 
   <div class="stage">
@@ -604,21 +928,6 @@
     <div class="dock-grip" onmousedown={onDockGripDown} title="Arrastrar para redimensionar"></div>
     <div class="transport">
       <div class="tp-left">
-        <button class="tp-btn" aria-label="Ir al inicio" onclick={() => seekOutput(0)}>
-          <Icon name="skip-back" size={16} />
-        </button>
-        <button class="tp-btn" aria-label="Fotograma anterior" onclick={() => stepFrame(-1)}>
-          <Icon name="step-back" size={16} />
-        </button>
-        <button class="tp-play" aria-label={playing ? 'Pausar' : 'Reproducir'} onclick={toggle}>
-          <Icon name={playing ? 'stop' : 'play'} size={19} />
-        </button>
-        <button class="tp-btn" aria-label="Fotograma siguiente" onclick={() => stepFrame(1)}>
-          <Icon name="step-fwd" size={16} />
-        </button>
-        <button class="tp-btn" aria-label="Ir al final" onclick={() => seekOutput(kept)}>
-          <Icon name="skip-fwd" size={16} />
-        </button>
         <span class="tp-time mono">
           <span class="t-cur">{fmtTime(outPos / 1000)}</span>
           <span class="t-sep">/</span>
@@ -626,140 +935,143 @@
         </span>
       </div>
 
-      <div class="tp-mid">
-        {#if activeInfo}
-          <span class="seg-read mono">
-            <span class="seg-tag">Bloque {activeInfo.n}/{activeInfo.total}</span>
-            <span class="seg-range">orig {fmtClock(activeInfo.start / 1000)}–{fmtClock(activeInfo.end / 1000)}</span>
-            <span class="seg-dur">({fmtTime(activeInfo.dur / 1000)})</span>
-          </span>
-        {/if}
+      <div class="tp-center">
+        <button class="tp-btn" aria-label="Capturar fotograma" onclick={screenshot}>
+          <Icon name="camera" size={18} />
+        </button>
+        <button class="tp-btn" aria-label="Ir al inicio" onclick={() => seekOutput(0)}>
+          <Icon name="skip-back" size={20} />
+        </button>
+        <button class="tp-btn" aria-label="Fotograma anterior" onclick={() => stepFrame(-1)}>
+          <Icon name="step-back" size={20} />
+        </button>
+        <button class="tp-play" aria-label={playing ? 'Pausar' : 'Reproducir'} onclick={toggle}>
+          <Icon name={playing ? 'stop' : 'play'} size={19} />
+        </button>
+        <button class="tp-btn" aria-label="Fotograma siguiente" onclick={() => stepFrame(1)}>
+          <Icon name="step-fwd" size={20} />
+        </button>
+        <button class="tp-btn" aria-label="Ir al final" onclick={() => seekOutput(kept)}>
+          <Icon name="skip-fwd" size={20} />
+        </button>
+        <button class="tp-btn" aria-label="Pantalla completa (F)" onclick={toggleFullscreen}>
+          <Icon name="maximize" size={18} />
+        </button>
       </div>
 
       <div class="tp-right">
-        <button class="act" onclick={cut}>
-          <Icon name="scissors" size={14} /> Cortar <kbd>C</kbd>
-        </button>
         <button class="act" disabled={editorState.segments.length <= 1} onclick={removeActive}>
           <Icon name="trash" size={14} /> Quitar
         </button>
-        <button class="act" onclick={resetTrim}>Reestablecer</button>
         <button class="act export" onclick={handleExport} disabled={editorState.exporting}>
           {editorState.exporting ? 'Exportando…' : 'Exportar'}
+          <Icon name="export" size={16} />
         </button>
       </div>
     </div>
 
-    {#if kept > 0}
-      <div class="tl" style="--gutter: 176px;">
-        <div class="tl-ruler">
-          {#each ticks as t, i}
-            <span
-              class="tick mono"
-              style="left: calc((100% - var(--gutter)) * {t.frac} + var(--gutter)); transform: translateX({i === 0 ? '0' : i === ticks.length - 1 ? '-100%' : '-50%'});"
-            >{t.label}</span>
-          {/each}
-        </div>
+    {#if kept > 0 || editorState.loading}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="tl" style="--gutter: 150px; --zoom: {zoom};" onwheel={onTimelineWheel}>
+    <div class="tl-ruler"></div>
 
-        <div class="tl-body" bind:this={bodyEl}>
-          <div class="row">
-            <div class="gutter">
-              <span class="g-title">Vídeo</span>
-              <span class="g-meta mono">
-                {editorState.segments.length} bloque{editorState.segments.length > 1 ? 's' : ''} · {fmtClock(kept / 1000)}
-              </span>
-            </div>
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="lane vlane" bind:this={laneEl} onmousedown={onLaneDown}>
-              {#each segView as s, i (i)}
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div
-                  class="block"
-                  class:active={i === editorState.activeSegment}
-                  style="left: {s.left}%; width: {s.width}%;"
-                  onmousedown={(e) => onBlockDown(e, i)}
-                >
-                  <span class="block-n mono">{i + 1}</span>
-                  {#if i === editorState.activeSegment}
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="grip start" onmousedown={(e) => onGripDown(e, i, 'start')}></span>
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="grip end" onmousedown={(e) => onGripDown(e, i, 'end')}></span>
-                  {/if}
-                </div>
-              {/each}
-            </div>
+    <div class="tl-body" bind:this={bodyEl}>
+      <div class="row">
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="lane vlane" class:reordering={!!lift} class:trimming bind:this={laneEl} onmousedown={onLaneDown}>
+          <div class="zw">
+          {#each segView as s (s.index)}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="block"
+            class:active={s.index === editorState.activeSegment}
+            class:lifted={!!lift && s.index === lift.index}
+            class:disabled={s.seg.disabled}
+            style="left: {s.left}%; width: {s.width}%; --scale: {LIFT_SCALE};"
+            onmousedown={(e) => onBlockDown(e, s.index)}
+            oncontextmenu={(e) => onBlockContext(e, s.index)}
+          >
+            <span class="block-n mono">{s.index + 1}</span>
+            {#if s.index === editorState.activeSegment}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span class="grip start" onmousedown={(e) => onGripDown(e, s.index, 'start')}></span>
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span class="grip end" onmousedown={(e) => onGripDown(e, s.index, 'end')}></span>
+            {/if}
           </div>
+          {/each}
+          </div>
+        </div>
+      </div>
 
-          {#if editorState.system}
-            <div class="row">
-              <div class="gutter audio">
-                <div class="g-head">
-                  <span class="dot" style="background: {SYS_HUE};"></span>
-                  <span class="g-title">Sistema</span>
-                </div>
-                <div class="vol">
-                  <button
-                    class="mute"
-                    class:on={editorState.mixer.sys_muted}
-                    aria-label="Silenciar sistema"
-                    onclick={() => { editorState.mixer.sys_muted = !editorState.mixer.sys_muted; markEdited(); }}
-                  ><Icon name="speaker" size={14} /></button>
-                  <input
-                    class="slider"
-                    type="range" min="0" max="1" step="0.01"
-                    value={editorState.mixer.sys_vol}
-                    oninput={(e) => { editorState.mixer.sys_vol = +(e.target as HTMLInputElement).value; markEdited(); }}
-                  />
-                </div>
-              </div>
-              <div class="lane alane" class:muted={editorState.mixer.sys_muted}>
-                <canvas bind:this={sysCanvas}></canvas>
-                {#if analyzing && !sysPeaks}<span class="wf-note mono">Analizando…</span>{/if}
+      <div class="arow">
+        {#snippet fader(chan: 'sys' | 'mic', vol: number, muted: boolean, label: string, icon: string)}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="fader" class:muted style="--v: {vol};">
+            <div
+              class="fader-rail"
+              role="slider"
+              tabindex="0"
+              aria-label={label}
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={Math.round(vol * 100)}
+              onmousedown={(e) => onFaderDown(e, chan)}
+              onkeydown={(e) => onFaderKey(e, chan)}
+              onmouseenter={(e) => onFaderHover(e, chan)}
+              onmousemove={(e) => onFaderHover(e, chan)}
+              onmouseleave={onFaderLeave}
+            >
+              <div class="fader-bar"><div class="fader-fill"></div></div>
+              <div class="fader-thumb"><span class="thumb-line"></span></div>
+            </div>
+            <button
+              class="fader-ico"
+              class:on={muted}
+              aria-label={muted ? `Activar ${label}` : `Silenciar ${label}`}
+              aria-pressed={muted}
+              onclick={() => toggleMute(chan)}
+            ><Icon name={icon} size={22} /></button>
+          </div>
+        {/snippet}
+
+        <div class="mixer-card" style="height: {mixerH}px;">
+          <div class="faders">
+            {#if !editorState.loading}
+              {#if editorState.mic}
+                {@render fader('mic', editorState.mixer.mic_vol, editorState.mixer.mic_muted, 'Audio del micrófono', 'mic')}
+              {/if}
+              {@render fader('sys', editorState.mixer.sys_vol, editorState.mixer.sys_muted, editorState.system ? 'Audio del sistema' : 'Audio', 'headphones')}
+            {/if}
+          </div>
+        </div>
+        <div class="alanes">
+          {#if !editorState.loading}
+            <div class="lane alane" class:muted={editorState.mixer.sys_muted}>
+              <div class="zw">
+                {#if editorState.system}
+                  <canvas bind:this={sysCanvas}></canvas>
+                {:else}
+                  <canvas bind:this={mixCanvas}></canvas>
+                  {#if !editorState.mixPeaks}<span class="wf-note mono">Sin audio</span>{/if}
+                {/if}
               </div>
             </div>
-          {/if}
-
-          {#if editorState.mic}
-            <div class="row">
-              <div class="gutter audio">
-                <div class="g-head">
-                  <span class="dot" style="background: {MIC_HUE};"></span>
-                  <span class="g-title">Micrófono</span>
-                </div>
-                <div class="vol">
-                  <button
-                    class="mute"
-                    class:on={editorState.mixer.mic_muted}
-                    aria-label="Silenciar micrófono"
-                    onclick={() => { editorState.mixer.mic_muted = !editorState.mixer.mic_muted; markEdited(); }}
-                  ><Icon name="speaker" size={14} /></button>
-                  <input
-                    class="slider"
-                    type="range" min="0" max="1" step="0.01"
-                    value={editorState.mixer.mic_vol}
-                    oninput={(e) => { editorState.mixer.mic_vol = +(e.target as HTMLInputElement).value; markEdited(); }}
-                  />
-                </div>
-              </div>
+            {#if editorState.mic}
               <div class="lane alane" class:muted={editorState.mixer.mic_muted}>
-                <canvas bind:this={micCanvas}></canvas>
-                {#if analyzing && !micPeaks}<span class="wf-note mono">Analizando…</span>{/if}
+                <div class="zw">
+                  <canvas bind:this={micCanvas}></canvas>
+                </div>
               </div>
-            </div>
+            {/if}
           {/if}
-
-          {#if !hasSeparate && !editorState.loading && !editorState.error}
-            <div class="row">
-              <div class="gutter audio"><span class="g-title">Audio</span></div>
-              <div class="lane single mono">Este clip tiene una sola pista de audio.</div>
-            </div>
-          {/if}
+        </div>
+      </div>
 
           <div
             class="playhead"
             class:scrub={scrubbing}
-            style="left: calc((100% - var(--gutter)) * {frac} + var(--gutter));"
+            style="left: calc((100% - var(--gutter)) * min(1, var(--zoom, 1)) * {frac} + var(--gutter));"
           >
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <span class="ph-knob" onmousedown={onKnobDown}></span>
@@ -771,6 +1083,25 @@
 
   {#if notice}
     <div class="notice mono">{notice}</div>
+  {/if}
+
+  {#if bubble}
+    <div class="fader-tip mono" style="left: {bubble.x}px; top: {bubble.y}px;">{bubble.pct}%</div>
+  {/if}
+
+  {#if blockMenu}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="ctx-backdrop"
+      onmousedown={closeBlockMenu}
+      oncontextmenu={(e) => { e.preventDefault(); closeBlockMenu(); }}
+    ></div>
+    <div class="ctx-menu" style="left: {blockMenu.x}px; top: {blockMenu.y}px;">
+      <button class="ctx-item" onclick={toggleDisableBlock}>
+        {editorState.segments[blockMenu.index]?.disabled ? 'Activar' : 'Desactivar'}
+      </button>
+      <button class="ctx-item danger" onclick={deleteBlock} disabled={editorState.segments.length <= 1}>Eliminar</button>
+    </div>
   {/if}
 </div>
 
@@ -810,13 +1141,39 @@
   }
   .sub-btn svg { width: 18px; height: 18px; }
   .sub-btn:hover { color: var(--text-0); background: var(--bg-2); }
+  .sub-btn:disabled { opacity: 0.3; pointer-events: none; }
   .sub-sep { color: var(--line); font-size: 13px; }
   .sub-label { color: var(--text-3); white-space: nowrap; }
   .sub-info { color: var(--text-1); white-space: nowrap; }
   .sub-path {
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    max-width: 260px; color: var(--text-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 260px;
+    font: inherit;
+    color: #5b9dff;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: color 0.14s ease;
   }
+  .sub-path:hover { color: #8ab6ff; text-decoration: underline; }
+  .sub-path:disabled { color: var(--text-3); cursor: default; text-decoration: none; }
+
+  .sub-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .sub-reset {
+    padding: 5px 11px;
+    font-size: 11.5px;
+    color: var(--text-2);
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    white-space: nowrap;
+    transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+  }
+  .sub-reset:hover { background: var(--bg-hover); color: var(--text-0); }
+
   .sub-close {
     width: 28px; height: 28px;
     display: grid; place-items: center;
@@ -878,7 +1235,7 @@
     position: relative;
     flex-shrink: 0;
     border-top: 1px solid var(--line);
-    background: var(--bg-1);
+    background: #080808;
     padding: 10px 16px 16px;
     display: flex;
     flex-direction: column;
@@ -898,15 +1255,15 @@
   }
   .dock-grip::before {
     content: '';
-    width: 44px;
-    height: 4px;
+    width: 34px;
+    height: 3px;
     border-radius: 999px;
-    background: var(--line-strong);
+    background: var(--line);
     transition: background 0.14s ease, width 0.14s ease;
   }
   .dock-grip:hover::before {
-    background: var(--text-3);
-    width: 64px;
+    background: var(--line-strong);
+    width: 46px;
   }
 
   .transport {
@@ -916,48 +1273,31 @@
     gap: 12px;
     min-height: 34px;
   }
-  .tp-left { display: flex; align-items: center; gap: 4px; }
-  .tp-mid { display: flex; justify-content: center; min-width: 0; }
-  .tp-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .tp-left { display: flex; align-items: center; justify-self: start; }
+  .tp-center { display: flex; align-items: center; gap: 4px; justify-self: center; }
+  .tp-right { display: flex; align-items: center; gap: 6px; justify-self: end; }
 
   .tp-btn {
-    width: 30px; height: 30px;
+    width: 32px; height: 32px;
     display: grid; place-items: center;
-    color: var(--text-2); border-radius: 7px;
+    color: var(--text-1); border-radius: 7px;
     transition: color 0.14s ease, background 0.14s ease;
   }
   .tp-btn:hover { color: var(--text-0); background: var(--bg-3); }
   .tp-play {
     width: 36px; height: 36px;
     display: grid; place-items: center;
-    color: var(--bg-0); background: var(--bright);
-    border-radius: 999px; margin: 0 4px; flex-shrink: 0;
-    transition: transform 0.12s ease, opacity 0.12s ease;
+    color: var(--text-0);
+    border-radius: 7px; margin: 0 4px; flex-shrink: 0;
+    transition: color 0.14s ease, background 0.14s ease, transform 0.12s ease;
   }
-  .tp-play:hover { opacity: 0.88; }
+  .tp-play:hover { color: var(--text-0); background: var(--bg-3); }
   .tp-play:active { transform: scale(0.94); }
 
-  .tp-time { margin-left: 10px; font-size: 12.5px; letter-spacing: 0.02em; white-space: nowrap; }
+  .tp-time { font-size: 12.5px; letter-spacing: 0.02em; white-space: nowrap; }
   .tp-time .t-cur { color: var(--text-0); }
   .tp-time .t-sep { color: var(--text-3); margin: 0 4px; }
   .tp-time .t-dur { color: var(--text-3); }
-
-  .seg-read {
-    display: inline-flex;
-    align-items: center;
-    gap: 9px;
-    padding: 5px 11px;
-    font-size: 11.5px;
-    border-radius: 999px;
-    background: var(--bg-2);
-    border: 1px solid var(--line);
-    white-space: nowrap;
-    overflow: hidden;
-    max-width: 100%;
-  }
-  .seg-tag { color: var(--accent-soft); font-weight: 600; }
-  .seg-range { color: var(--text-1); }
-  .seg-dur { color: var(--text-3); }
 
   .act {
     display: inline-flex;
@@ -974,16 +1314,10 @@
   }
   .act:hover { background: var(--bg-hover); color: var(--text-0); }
   .act:disabled { opacity: 0.4; pointer-events: none; }
-  .act kbd {
-    font-family: var(--font-mono);
-    font-size: 9.5px;
-    padding: 1px 4px;
-    color: var(--text-3);
-    background: var(--bg-0);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-  }
   .act.export {
+    padding: 9px 22px;
+    gap: 8px;
+    font-size: 13px;
     color: var(--bg-0);
     background: var(--bright);
     border-color: transparent;
@@ -992,61 +1326,39 @@
   .act.export:hover { opacity: 0.9; background: var(--bright); color: var(--bg-0); }
 
   /* ===== timeline ===== */
+  /* Lanes y ruler al 100% siempre. El contenido dentro de .zw escala con --zoom. */
+  /* overflow: scroll (no auto) reserva siempre el hueco de ambas barras: como el ancho de
+     reglas/lanes y el playhead se miden contra el content-box de .tl, dejar ese hueco fijo evita
+     que todo se reescale/salte cuando la barra aparece. El track es transparente (estilos globales),
+     así que el espacio reservado no se nota: solo asoma el thumb cuando hay desbordamiento real. */
   .tl {
     display: flex;
     flex-direction: column;
     gap: 6px;
     flex: 1;
     min-height: 0;
-    overflow-x: clip;
-    overflow-y: auto;
+    overflow: scroll;
+    scrollbar-gutter: stable;
   }
-  .tl-ruler { position: relative; height: 14px; }
-  .tick { position: absolute; top: 0; font-size: 10px; color: var(--text-3); white-space: nowrap; }
+  .tl::-webkit-scrollbar-corner { background: transparent; }
+  .tl-ruler {
+    position: relative;
+    height: 14px;
+    width: max(100%, calc(var(--zoom, 1) * 100%));
+    flex-shrink: 0;
+  }
+  .zw { position: relative; height: 100%; width: 100%; }
 
-  .tl-body { position: relative; display: flex; flex-direction: column; gap: 7px; }
-  .row { display: grid; grid-template-columns: var(--gutter) 1fr; align-items: stretch; }
-
-  .gutter {
+  .tl-body {
+    position: relative;
     display: flex;
     flex-direction: column;
-    justify-content: center;
-    gap: 5px;
-    padding: 0 14px 0 2px;
-    min-width: 0;
+    gap: 7px;
+    width: max(100%, calc(var(--zoom, 1) * 100%));
+    flex-shrink: 0;
+    overflow-x: clip;
   }
-  .g-title { font-size: 12px; font-weight: 600; color: var(--text-1); white-space: nowrap; }
-  .g-meta { font-size: 10px; color: var(--text-3); white-space: nowrap; }
-  .g-head { display: flex; align-items: center; gap: 7px; }
-  .dot { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; }
-
-  .vol { display: flex; align-items: center; gap: 8px; }
-  .mute {
-    width: 24px; height: 24px;
-    display: grid; place-items: center;
-    color: var(--text-1); border-radius: 5px; flex-shrink: 0;
-    transition: color 0.14s ease, background 0.14s ease;
-  }
-  .mute:hover { color: var(--text-0); background: var(--bg-hover); }
-  .mute.on { color: var(--rec); }
-  .slider {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: 4px;
-    border-radius: 3px;
-    background: var(--bg-3);
-    cursor: pointer;
-  }
-  .slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 13px;
-    height: 13px;
-    border-radius: 999px;
-    background: var(--bright);
-    border: none;
-  }
+  .row { display: grid; grid-template-columns: var(--gutter) 1fr; align-items: stretch; }
 
   .lane {
     position: relative;
@@ -1055,11 +1367,12 @@
     border: 1px solid var(--line);
     background: var(--bg-0);
   }
-  .vlane { height: 46px; cursor: pointer; }
+  /* Fondo negro: lo que no cubre ninguna sección es el "bloque negro" del montaje (no se exporta).
+     grid-column: 2 mantiene el lane alineado con los de audio tras quitar el gutter de la fila. */
+  .vlane { grid-column: 2; height: 46px; cursor: pointer; background: #000; }
   .alane { height: 50px; transition: opacity 0.16s ease; }
   .alane.muted { opacity: 0.5; }
-  .alane canvas { display: block; width: 100%; height: 100%; }
-  .wf-note {
+  .alane canvas { display: block; width: 100%; height: 100%; }  .wf-note {
     position: absolute;
     top: 50%;
     left: 12px;
@@ -1079,9 +1392,10 @@
       color-mix(in srgb, var(--accent) 17%, transparent)
     );
     border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
-    cursor: grab;
+    cursor: pointer;
     overflow: hidden;
-    transition: border-color 0.12s ease, background 0.12s ease;
+    transition: left 0.16s cubic-bezier(0.22, 1, 0.36, 1), transform 0.12s ease,
+      box-shadow 0.12s ease, border-color 0.12s ease, background 0.12s ease, opacity 0.12s ease;
   }
   .block:hover { border-color: color-mix(in srgb, var(--accent) 62%, var(--line)); }
   .block.active {
@@ -1093,6 +1407,38 @@
     border-color: var(--accent-soft);
     box-shadow: 0 0 0 1px var(--accent-soft), 0 4px 16px -6px var(--accent-glow);
   }
+  /* Bloque levantado: sigue al cursor (sin transición de `left`), escalado y elevado. */
+  .block.lifted {
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    transform: scale(var(--scale, 1.05));
+    z-index: 20;
+    cursor: grabbing;
+    border-color: var(--accent-soft);
+    box-shadow: 0 10px 26px -8px rgba(0, 0, 0, 0.75), 0 0 0 1px var(--accent-soft);
+  }
+  /* Imán: mientras se reordena, los demás bloques se atenúan y se deslizan para hacer hueco. */
+  .vlane.reordering { overflow: visible; }
+  .vlane.reordering .block:not(.lifted) { opacity: 0.72; }
+  /* Al recortar, el borde debe seguir al cursor al instante (sin la animación de `left`). */
+  .vlane.trimming .block { transition: none; }
+  /* Bloque desactivado: se ignora en reproducción/exportación pero sigue visible para reactivarlo.
+     Atenuado, desaturado y con tramado diagonal; sin el resplandor de selección. */
+  .block.disabled {
+    opacity: 0.5;
+    filter: grayscale(1);
+    background:
+      repeating-linear-gradient(
+        -45deg,
+        rgba(255, 255, 255, 0.06) 0,
+        rgba(255, 255, 255, 0.06) 6px,
+        rgba(255, 255, 255, 0.015) 6px,
+        rgba(255, 255, 255, 0.015) 12px
+      ),
+      var(--bg-2);
+    border-color: var(--line-strong);
+    box-shadow: none;
+  }
+  .block.disabled .block-n { color: rgba(255, 255, 255, 0.5); }
   .block-n {
     position: absolute;
     top: 3px;
@@ -1125,16 +1471,6 @@
   .grip.start { left: -1px; border-radius: 5px 0 0 5px; }
   .grip.end { right: -1px; border-radius: 0 5px 5px 0; }
 
-  .single {
-    display: flex;
-    align-items: center;
-    padding: 0 14px;
-    height: 50px;
-    font-size: 12px;
-    color: var(--text-3);
-    cursor: default;
-  }
-
   .playhead {
     position: absolute;
     top: -7px;
@@ -1147,32 +1483,25 @@
   }
   .ph-knob {
     position: absolute;
-    top: -5px;
+    top: -7px;
     left: 50%;
     transform: translateX(-50%);
-    width: 11px;
-    height: 11px;
-    border-radius: 999px;
+    width: 12px;
+    height: 15px;
+    border-radius: 3px;
     background: var(--bright);
-    box-shadow: 0 0 8px rgba(240, 242, 247, 0.45);
     pointer-events: auto;
     cursor: grab;
-    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    transition: transform 0.12s ease, opacity 0.12s ease;
   }
   .ph-knob::before {
     content: '';
     position: absolute;
     inset: -8px;
-    border-radius: 999px;
-  }
-  .ph-knob:hover {
-    transform: translateX(-50%) scale(1.65);
-    box-shadow: 0 0 12px rgba(240, 242, 247, 0.7);
   }
   .playhead.scrub .ph-knob {
-    transform: translateX(-50%) scale(1.65);
     cursor: grabbing;
-    box-shadow: 0 0 14px rgba(240, 242, 247, 0.85);
+    opacity: 0.85;
   }
 
   .notice {
@@ -1192,4 +1521,135 @@
     text-align: center;
     pointer-events: none;
   }
+
+  /* Card del mezclador: panel flotante en el gutter, alineado a su borde derecho (junto a las
+     ondas) y elevado (translateY -53) para que su borde superior cuadre con la lane de vídeo
+     (46 + gap 7). Dos faders verticales (mic / sistema) con icono-mute debajo. */
+  .arow { display: grid; grid-template-columns: var(--gutter) 1fr; align-items: start; }
+  .mixer-card {
+    --lift: 73px;
+    position: sticky;
+    left: 0;
+    z-index: 25;
+    justify-self: start;
+    width: max-content;
+    display: flex;
+    margin-left: 2px;
+    margin-right: 14px;
+    padding: 14px 18px 12px;
+    background: #0a0a0a;
+    border: 1px solid var(--line-strong);
+    border-radius: 18px;
+    box-shadow: 0 18px 42px -14px rgba(0, 0, 0, 0.7);
+    /* Sube la card para alinearla con la lane de vídeo; el margin-bottom negativo cancela el hueco
+       muerto que esa subida dejaría en el flujo, para que la sección inferior no crezca de más. */
+    transform: translateY(calc(-1 * var(--lift)));
+    margin-bottom: calc(-1 * var(--lift));
+  }
+  .faders { display: flex; gap: 20px; }
+  .fader { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  /* El cursor controla el centro del pulgar, por eso el relleno y el pulgar descuentan su alto
+     (--th) del recorrido. --v = volumen [0..1] (lo fija el componente por canal). */
+  .fader-rail {
+    --th: 20px;
+    position: relative;
+    flex: 1;
+    width: 34px;
+    cursor: pointer;
+    outline: none;
+  }
+  .fader-rail:focus-visible { border-radius: 8px; box-shadow: 0 0 0 2px var(--accent-soft); }
+  .fader-bar {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 10px;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    overflow: hidden;
+    background: linear-gradient(180deg, #3a3a3d, #242427);
+  }
+  .fader-fill {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: calc(var(--v) * (100% - var(--th)) + var(--th) / 2);
+    background: #f2f2f2;
+  }
+  .fader-thumb {
+    position: absolute;
+    left: 50%;
+    bottom: calc(var(--v) * (100% - var(--th)));
+    transform: translateX(-50%);
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: var(--th);
+    border-radius: 5px;
+    background: #fff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+  }
+  .thumb-line { width: 2px; height: 10px; border-radius: 2px; background: #080808; }
+  /* Burbuja flotante (fixed) posicionada por JS sobre el pulgar; vive a nivel del overlay para que
+     el overflow de la timeline no la recorte. translate(-50%,-100%) deja su base sobre el pulgar. */
+  .fader-tip {
+    position: fixed;
+    transform: translate(-50%, -100%);
+    padding: 4px 9px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-1);
+    background: #0a0a0a;
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 300;
+  }
+  .fader-ico {
+    width: 36px;
+    height: 36px;
+    display: grid;
+    place-items: center;
+    color: var(--text-0);
+    border-radius: 8px;
+    transition: color 0.12s ease, background 0.12s ease, opacity 0.16s ease;
+  }
+  .fader-ico:hover { background: var(--bg-3); }
+  .fader-ico.on { color: var(--rec); }
+  .fader.muted .fader-rail { opacity: 0.4; }
+  .alanes { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+
+  /* Menú contextual del bloque (clic derecho). El backdrop captura el clic fuera para cerrarlo. */
+  .ctx-backdrop { position: fixed; inset: 0; z-index: 200; }
+  .ctx-menu {
+    position: fixed;
+    z-index: 201;
+    min-width: 150px;
+    padding: 5px;
+    background: var(--bg-2);
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    box-shadow: 0 14px 36px -10px rgba(0, 0, 0, 0.7);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ctx-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    color: var(--text-1);
+    border-radius: 6px;
+    white-space: nowrap;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .ctx-item:hover { background: var(--bg-hover); color: var(--text-0); }
+  .ctx-item:disabled { opacity: 0.4; pointer-events: none; }
+  .ctx-item.danger { color: var(--rec); }
+  .ctx-item.danger:hover { background: color-mix(in srgb, var(--rec) 16%, transparent); color: var(--rec); }
 </style>

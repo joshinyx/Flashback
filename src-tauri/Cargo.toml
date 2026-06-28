@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
+tokio = { version = "1", features = ["rt"] }
 urlencoding = "2"
 # time 0.3.48 rompe la coherencia con cookie 0.18.1 (que arrastra Tauri): error E0119.
 time = "=0.3.47"

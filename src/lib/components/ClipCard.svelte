@@ -210,8 +210,8 @@
         {#if open}
           <div class="menu" role="menu">
             <button role="menuitem" onclick={(e) => { e.stopPropagation(); openEditor(clip); }}><Icon name="scissors" size={15} sw={1.9} /> Abrir en editor</button>
-            <button role="menuitem" onclick={startRename}><Icon name="edit" size={15} sw={1.9} /> Renombrar</button>
-            <button role="menuitem" onclick={openLocation}><Icon name="folder" size={15} sw={1.9} /> Abrir ubicación</button>
+            <button role="menuitem" onclick={startRename}><Icon name="rename" size={15} sw={1.9} /> Renombrar</button>
+            <button role="menuitem" onclick={openLocation}><Icon name="folder-open" size={15} sw={1.9} /> Abrir ubicación</button>
             <div class="sep"></div>
             <button role="menuitem" class="danger" onclick={deleteClip}><Icon name="trash" size={15} sw={1.9} /> Borrar</button>
           </div>
