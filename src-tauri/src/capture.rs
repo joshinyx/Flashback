@@ -1200,10 +1200,7 @@ mod win {
         match muxed {
             Ok(Ok(())) => {
                 if !source.is_empty() {
-                    let meta = serde_json::json!({"source": source});
-                    if let Ok(json) = serde_json::to_string(&meta) {
-                        let _ = std::fs::write(path.replace(".mp4", ".clip.json"), json);
-                    }
+                    let _ = crate::library::write_embedded_source(std::path::Path::new(&path), source);
                 }
                 Some(path)
             }

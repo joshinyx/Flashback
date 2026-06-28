@@ -64,6 +64,25 @@ export function dayLabel(date: Date): string {
   return `${date.getDate()} ${MONTHS[date.getMonth()]} ${date.getFullYear()}`;
 }
 
+// Las capturas de pantalla guardan el origen como "Pantalla N"; cualquier otro origen es un
+// juego. Es la misma convención con la que el backend rellena el `source` al capturar.
+export function isScreenSource(source: string): boolean {
+  return /^pantalla\b/i.test(source.trim());
+}
+
+export type LibraryFilter = { kind: 'edited' } | { kind: 'source'; value: string };
+
+export function sameFilter(a: LibraryFilter, b: LibraryFilter): boolean {
+  if (a.kind !== b.kind) return false;
+  return a.kind === 'source' ? a.value === (b as { kind: 'source'; value: string }).value : true;
+}
+
+// Sin filtros seleccionados se muestran todos; con varios, basta con que el clip cumpla uno (OR).
+export function clipMatchesFilters(clip: Clip, selected: LibraryFilter[]): boolean {
+  if (selected.length === 0) return true;
+  return selected.some((f) => (f.kind === 'edited' ? !!clip.edited : clip.source === f.value));
+}
+
 export type ClipGroup = { label: string; source: string; clips: Clip[] };
 
 export function groupClips(list: Clip[]): ClipGroup[] {

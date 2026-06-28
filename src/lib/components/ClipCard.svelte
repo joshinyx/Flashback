@@ -176,9 +176,9 @@
   </button>
 
   <div class="meta">
-    {#if clip.source}<span class="src label">{clip.source}</span>{/if}
+    <div class="info">
+      {#if clip.source}<span class="src label">{clip.source}</span>{/if}
 
-    <div class="row">
       {#if renaming}
         <input
           class="title-edit"
@@ -195,31 +195,32 @@
       {:else}
         <h3 class="title">{clip.title}</h3>
       {/if}
-      <div class="actions">
-        <button class="act" aria-label="Compartir" onclick={(e) => e.stopPropagation()}><Icon name="share" size={19} sw={2} /></button>
-        <button
-          class="act"
-          aria-label="Más opciones"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          onclick={toggleMenu}
-        >
-          <Icon name="more" size={21} sw={2} />
-        </button>
 
-        {#if open}
-          <div class="menu" role="menu">
-            <button role="menuitem" onclick={(e) => { e.stopPropagation(); openEditor(clip); }}><Icon name="scissors" size={15} sw={1.9} /> Abrir en editor</button>
-            <button role="menuitem" onclick={startRename}><Icon name="rename" size={15} sw={1.9} /> Renombrar</button>
-            <button role="menuitem" onclick={openLocation}><Icon name="folder-open" size={15} sw={1.9} /> Abrir ubicación</button>
-            <div class="sep"></div>
-            <button role="menuitem" class="danger" onclick={deleteClip}><Icon name="trash" size={15} sw={1.9} /> Borrar</button>
-          </div>
-        {/if}
-      </div>
+      <span class="when mono"><Icon name="clock" size={13} sw={2} />{formatRelative(clip.createdAt)}</span>
     </div>
 
-    <span class="when mono"><Icon name="clock" size={13} sw={2} />{formatRelative(clip.createdAt)}</span>
+    <div class="actions">
+      <button class="act" aria-label="Compartir" onclick={(e) => e.stopPropagation()}><Icon name="share" size={19} sw={2} /></button>
+      <button
+        class="act"
+        aria-label="Más opciones"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onclick={toggleMenu}
+      >
+        <Icon name="more" size={21} sw={2} />
+      </button>
+
+      {#if open}
+        <div class="menu" role="menu">
+          <button role="menuitem" onclick={(e) => { e.stopPropagation(); openEditor(clip); }}><Icon name="scissors" size={15} sw={1.9} /> Abrir en editor</button>
+          <button role="menuitem" onclick={startRename}><Icon name="rename" size={15} sw={1.9} /> Renombrar</button>
+          <button role="menuitem" onclick={openLocation}><Icon name="folder-open" size={15} sw={1.9} /> Abrir ubicación</button>
+          <div class="sep"></div>
+          <button role="menuitem" class="danger" onclick={deleteClip}><Icon name="trash" size={15} sw={1.9} /> Borrar</button>
+        </div>
+      {/if}
+    </div>
   </div>
 </article>
 
@@ -368,21 +369,29 @@
   }
 
   .meta {
-    padding: 11px 14px 13px;
-  }
-  .src {
-    display: block;
-    margin-bottom: 3px;
-    line-height: 1;
-    font-size: 12px;
-    color: var(--text-2);
-  }
-
-  .row {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
+    padding: 11px 14px 13px;
+  }
+  /* Columna de texto centrada verticalmente: con 1/2/3 elementos (origen, título, fecha) se
+     reparten desde el centro. min-height fija la altura del pie para que sea igual entre tarjetas
+     y los botones de la derecha queden siempre en el mismo sitio aunque cambie el texto. */
+  .info {
+    flex: 1;
+    min-width: 0;
+    min-height: 52px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+  }
+  .src {
+    display: block;
+    line-height: 1;
+    font-size: 12px;
+    color: var(--text-2);
   }
   .title {
     font-size: 16px;
@@ -394,7 +403,6 @@
     text-overflow: ellipsis;
   }
   .title-edit {
-    flex: 1;
     min-width: 0;
     font-size: 16px;
     font-weight: 560;
@@ -475,7 +483,6 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-top: 4px;
     font-size: 11px;
     letter-spacing: 0.06em;
     text-transform: uppercase;

@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { invoke } from '@tauri-apps/api/core';
   import Icon from '$lib/components/Icon.svelte';
+  import { refreshLibrary } from '$lib/library.svelte';
   import {
     hotkeys,
     capture,
@@ -33,7 +35,29 @@
   let encoder = $state('Automático');
   let autoDelete = $state(true);
 
-  const folder = 'C:\\Users\\joshiny\\Videos\\Flashback';
+  let folder = $state('');
+  let changingFolder = $state(false);
+  $effect(() => {
+    invoke<string>('clips_dir').then((d) => (folder = d)).catch(() => {});
+  });
+
+  async function changeFolder() {
+    if (changingFolder) return;
+    changingFolder = true;
+    try {
+      const picked = await invoke<string | null>('pick_folder');
+      if (picked) {
+        await invoke('set_clips_dir', { dir: picked });
+        folder = picked;
+        // La biblioteca lee de la carpeta activa: recargar para reflejar el cambio.
+        await refreshLibrary();
+      }
+    } catch (e) {
+      console.error('set_clips_dir', e);
+    } finally {
+      changingFolder = false;
+    }
+  }
 
   const shortcutRows: { key: HotkeyAction; label: string }[] = [
     { key: 'saveReplay', label: 'Guardar replay' },
@@ -229,8 +253,8 @@
   <section class="panel">
     <span class="label panel-title">Almacenamiento</span>
     <div class="setting">
-      <div class="info"><h3>Carpeta de clips</h3><p class="mono path">{folder}</p></div>
-      <button class="btn"><Icon name="folder" size={15} /> Cambiar</button>
+      <div class="info"><h3>Carpeta de clips</h3><p class="mono path">{folder}</p><p>Cambiarla solo afecta a los clips nuevos; los anteriores se siguen mostrando.</p></div>
+      <button class="btn" onclick={changeFolder} disabled={changingFolder}><Icon name="folder" size={15} /> Cambiar</button>
     </div>
     <div class="setting">
       <div class="info"><h3>Borrado automático</h3><p>Elimina los clips no marcados como favoritos al llenarse.</p></div>

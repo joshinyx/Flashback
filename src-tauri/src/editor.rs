@@ -56,21 +56,42 @@ pub struct ClipEdit {
 
 #[cfg(target_os = "windows")]
 pub use win::{
-    clip_fps, export_clip, frame_times, keyframe_times, load_edit, prepare_clip_audio, save_edit,
+    clip_fps, export_clip, frame_times, keyframe_times, prepare_clip_audio,
 };
+
+// Edición no destructiva: cortes y mezcla viven en el índice único de app-data (no en un sidecar
+// por clip), indexados por la ruta del MP4. El original nunca se toca. No usa Media Foundation,
+// así que es común a todas las plataformas.
+pub fn save_edit(index: String, path: String, edit: ClipEdit) -> Result<(), String> {
+    let val = serde_json::to_value(&edit).map_err(|e| e.to_string())?;
+    crate::edits::save(std::path::Path::new(&index), &path, val);
+    Ok(())
+}
+
+pub fn load_edit(index: String, path: String) -> Result<ClipEdit, String> {
+    let idx = std::path::Path::new(&index);
+    if let Some(val) = crate::edits::load(idx, &path) {
+        return serde_json::from_value(val).map_err(|e| e.to_string());
+    }
+    // Migración: importar el viejo sidecar `<clip>.edit.json` al índice y borrarlo.
+    let legacy = std::path::Path::new(&path).with_extension("edit.json");
+    if let Ok(s) = std::fs::read_to_string(&legacy) {
+        if let Ok(edit) = serde_json::from_str::<ClipEdit>(&s) {
+            if let Ok(val) = serde_json::to_value(&edit) {
+                crate::edits::save(idx, &path, val);
+            }
+            let _ = std::fs::remove_file(&legacy);
+            return Ok(edit);
+        }
+    }
+    Ok(ClipEdit {
+        segments: Vec::new(),
+        mixer: MixerState::default(),
+    })
+}
 
 #[cfg(not(target_os = "windows"))]
 pub fn prepare_clip_audio(_path: String) -> Result<ClipAudio, String> {
-    Err("El editor solo está disponible en Windows".into())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn load_edit(_path: String) -> Result<ClipEdit, String> {
-    Err("El editor solo está disponible en Windows".into())
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn save_edit(_path: String, _edit: ClipEdit) -> Result<(), String> {
     Err("El editor solo está disponible en Windows".into())
 }
 
@@ -90,7 +111,7 @@ pub fn clip_fps(_path: String) -> Result<u32, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn export_clip(_src: String, _dst: String, _edit: ClipEdit) -> Result<(), String> {
+pub fn export_clip<F: Fn(f32)>(_src: String, _dst: String, _edit: ClipEdit, _progress: F) -> Result<(), String> {
     Err("El editor solo está disponible en Windows".into())
 }
 
@@ -100,7 +121,8 @@ mod win {
 
     use windows::core::{Result, GUID, HSTRING};
     use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
     use super::{ClipAudio, ClipEdit};
 
@@ -407,27 +429,6 @@ mod win {
         with_mf(move || frame_times_inner(&path))
     }
 
-    // Edición no destructiva: los cortes y la mezcla se guardan en un sidecar JSON junto al
-    // clip (mismo criterio que el `.clip.json` de la biblioteca). El MP4 original no se toca.
-    fn edit_sidecar(path: &str) -> std::path::PathBuf {
-        std::path::Path::new(path).with_extension("edit.json")
-    }
-
-    pub fn save_edit(path: String, edit: ClipEdit) -> std::result::Result<(), String> {
-        let json = serde_json::to_string(&edit).map_err(|e| e.to_string())?;
-        std::fs::write(edit_sidecar(&path), json).map_err(|e| e.to_string())
-    }
-
-    pub fn load_edit(path: String) -> std::result::Result<ClipEdit, String> {
-        match std::fs::read_to_string(edit_sidecar(&path)) {
-            Ok(s) => serde_json::from_str::<ClipEdit>(&s).map_err(|e| e.to_string()),
-            Err(_) => Ok(ClipEdit {
-                segments: Vec::new(),
-                mixer: super::MixerState::default(),
-            }),
-        }
-    }
-
     pub fn keyframe_times(path: String) -> std::result::Result<Vec<f64>, String> {
         with_mf(move || keyframe_times_inner(&path))
     }
@@ -460,12 +461,29 @@ mod win {
         Ok(times)
     }
 
-    pub fn export_clip(src: String, dst: String, edit: ClipEdit) -> std::result::Result<(), String> {
+    pub fn export_clip<F: Fn(f32) + Send + 'static>(
+        src: String,
+        dst: String,
+        edit: ClipEdit,
+        progress: F,
+    ) -> std::result::Result<(), String> {
         std::thread::spawn(move || {
             unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
             ensure_mf();
-            let r = do_export(&src, &dst, &edit);
+            let r = do_export(&src, &dst, &edit, &progress);
             unsafe { CoUninitialize(); }
+            // El clip editado hereda el origen del original (juego/monitor) embebiéndolo igual que
+            // en la captura, para que conserve su etiqueta en la biblioteca.
+            if r.is_ok() {
+                let source = crate::library::clip_source(std::path::Path::new(&src))
+                    .unwrap_or_default();
+                if !source.is_empty() {
+                    let _ = crate::library::write_embedded_source(
+                        std::path::Path::new(&dst),
+                        &source,
+                    );
+                }
+            }
             r
         })
         .join()
@@ -480,45 +498,6 @@ mod win {
         bitrate: u32,
     }
 
-    fn extract_video_range(src: &str, start_ms: f64, end_ms: f64, meta: &VideoMeta, keyframes: &[f64]) -> std::result::Result<Vec<H264Packet>, String> {
-        let mf = |e: windows::core::Error| format!("{e:?}");
-
-        let in_key_ms = keyframes.iter()
-            .rev()
-            .find(|k| **k <= start_ms)
-            .copied()
-            .unwrap_or(0.0);
-
-        let frame_accurate = (start_ms - in_key_ms).abs() >= 1.0;
-        let packets = if frame_accurate {
-            let next_kf = keyframes.iter()
-                .find(|k| **k > start_ms)
-                .copied()
-                .unwrap_or(end_ms);
-            let boundary = reencode_boundary_gop(src, start_ms, in_key_ms, next_kf, &meta)
-                .map_err(mf)?;
-            if boundary.is_empty() {
-                return Err("El recorte del borde no produjo fotogramas".into());
-            }
-            let bd = boundary.last().map(|(_, t, d, _)| t + d).unwrap_or(0);
-
-            let rest = if next_kf < end_ms {
-                let mut p = extract_h264_packets(src, next_kf, end_ms).map_err(mf)?;
-                for (_, t, _, _) in &mut p { *t += bd; }
-                p
-            } else {
-                Vec::new()
-            };
-
-            let mut all = boundary;
-            all.extend(rest);
-            all
-        } else {
-            extract_h264_packets(src, in_key_ms, end_ms).map_err(mf)?
-        };
-        Ok(packets)
-    }
-
     fn read_video_meta(path: &str) -> Result<VideoMeta> {
         let reader = open_reader(path)?;
         let v_idx = find_stream(&reader, MFMediaType_Video)?;
@@ -530,13 +509,17 @@ mod win {
         let fps_n = (fps_packed >> 32) as u32;
         let fps_d = (fps_packed & 0xFFFFFFFF) as u32;
         let fps = if fps_d == 0 { 30 } else { fps_n / fps_d };
-        let bitrate = unsafe { mt.GetUINT32(&MF_MT_AVG_BITRATE) }.unwrap_or(0);
+        // Bitrate objetivo para recodificar en el export. MF no siempre expone MF_MT_AVG_BITRATE en
+        // el MP4, así que si falta (o es ínfimo) se usa un suelo por resolución·fps para no exportar
+        // con mala calidad. Si el media type sí lo da, gana ese.
+        let mt_bitrate = unsafe { mt.GetUINT32(&MF_MT_AVG_BITRATE) }.unwrap_or(0);
+        let floor = ((w as u64 * h as u64 * fps.max(1) as u64) / 8).clamp(4_000_000, 80_000_000) as u32;
 
         Ok(VideoMeta {
             width: w,
             height: h,
             fps: fps.max(1),
-            bitrate: bitrate.max(1_000_000),
+            bitrate: mt_bitrate.max(floor),
         })
     }
 
@@ -553,400 +536,218 @@ mod win {
         Err(windows::core::Error::from(windows::core::HRESULT(0x80070002u32 as i32)))
     }
 
-    type H264Packet = (Vec<u8>, i64, i64, bool);
-
-    fn extract_h264_packets(path: &str, in_ms: f64, end_ms: f64) -> Result<Vec<H264Packet>> {
-        let reader = open_reader(path)?;
-        let idx = find_stream(&reader, MFMediaType_Video)?;
-        unsafe { reader.SetStreamSelection(ALL_STREAMS, false)? };
-        unsafe { reader.SetStreamSelection(idx, true)? };
-
-        let in_hns = (in_ms * 10_000.0) as i64;
-        let end_hns = (end_ms * 10_000.0) as i64;
-        let mut out = Vec::new();
-        let mut base: Option<i64> = None;
-
-        loop {
-            let mut flags = 0u32;
-            let mut sample: Option<IMFSample> = None;
-            unsafe { reader.ReadSample(idx, 0, None, Some(&mut flags), None, Some(&mut sample))? };
-            if flags & ENDOFSTREAM != 0 { break; }
-            let Some(sample) = sample else { continue };
-            let t = unsafe { sample.GetSampleTime()? };
-            if t < in_hns { continue; }
-            if t >= end_hns && end_hns > 0 { break; }
-
-            let is_sync = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-            let dur = unsafe { sample.GetSampleDuration() }.unwrap_or(0);
-            let buf = unsafe { sample.ConvertToContiguousBuffer()? };
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            let mut cur = 0u32;
-            unsafe { buf.Lock(&mut ptr, None, Some(&mut cur))? };
-            if cur == 0 { unsafe { buf.Unlock()? }; continue; }
-            let data = unsafe { std::slice::from_raw_parts(ptr, cur as usize) }.to_vec();
-            unsafe { buf.Unlock()? };
-
-            let bt = base.unwrap_or(t);
-            if base.is_none() { base = Some(t); }
-            out.push((data, t - bt, dur, is_sync));
-        }
-        Ok(out)
-    }
-
-    fn create_h264_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<(IMFTransform, u32)> {
-        let encoder: IMFTransform = unsafe {
-            CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)?
-        };
-
-        // El encoder MFT de H.264 no valida el tipo de entrada hasta tener fijado el de salida:
-        // hay que llamar SetOutputType antes que SetInputType o devuelve MF_E_TRANSFORM_TYPE_NOT_SET.
-        // El tipo de salida debe incluir MF_MT_INTERLACE_MODE (atributo obligatorio del encoder).
-        let out_type = unsafe { MFCreateMediaType()? };
-        unsafe { out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)? };
-        unsafe { out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)? };
-        unsafe { out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))? };
-        unsafe { out_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))? };
-        unsafe { out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)? };
-        unsafe { out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)? };
-        unsafe { encoder.SetOutputType(0, &out_type, 0)? };
-
-        let in_type = unsafe { MFCreateMediaType()? };
-        unsafe { in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)? };
-        unsafe { in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)? };
-        unsafe { in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(width, height))? };
-        unsafe { in_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(fps, 1))? };
-        unsafe { in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)? };
-        unsafe { encoder.SetInputType(0, &in_type, 0)? };
-
-        let attrs = unsafe { encoder.GetAttributes()? };
-        unsafe { attrs.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, 0)? };
-        unsafe { attrs.SetUINT32(&CODECAPI_AVEncCommonQuality, 100)? };
-        // cbSize: tamaño del buffer de salida que el llamante debe reservar para ProcessOutput.
-        let out_size = unsafe { encoder.GetOutputStreamInfo(0)? }.cbSize.max(1 << 16);
-
-        unsafe { encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)? };
-        unsafe { encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)? };
-
-        Ok((encoder, out_size))
-    }
-
-    // El encoder SW de H.264 no marca MFT_OUTPUT_STREAM_PROVIDES_SAMPLES: el llamante debe aportar
-    // el IMFSample de salida (buffer de out_size). Pasar pSample nulo devuelve E_INVALIDARG. Drena
-    // todas las salidas disponibles hasta que el MFT pide más entrada.
-    fn pull_encoder_output(
-        encoder: &IMFTransform,
-        out_size: u32,
-        output: &mut Vec<H264Packet>,
-    ) -> Result<()> {
-        loop {
-            let sample = unsafe { MFCreateSample()? };
-            let buf = unsafe { MFCreateMemoryBuffer(out_size)? };
-            unsafe { sample.AddBuffer(&buf)? };
-
-            let mut data = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: std::mem::ManuallyDrop::new(Some(sample)),
-                dwStatus: 0,
-                pEvents: std::mem::ManuallyDrop::new(None),
-            };
-            let mut status = 0u32;
-            let res = unsafe { encoder.ProcessOutput(0, std::slice::from_mut(&mut data), &mut status) };
-            let produced = std::mem::ManuallyDrop::into_inner(data.pSample);
-            match res {
-                Ok(()) => {
-                    if let Some(out_s) = produced {
-                        let t = unsafe { out_s.GetSampleTime() }.unwrap_or(0);
-                        let dur = unsafe { out_s.GetSampleDuration() }.unwrap_or(0);
-                        let cbuf = unsafe { out_s.ConvertToContiguousBuffer()? };
-                        let mut ptr: *mut u8 = std::ptr::null_mut();
-                        let mut cur = 0u32;
-                        unsafe { cbuf.Lock(&mut ptr, None, Some(&mut cur))? };
-                        if cur > 0 {
-                            let bytes = unsafe { std::slice::from_raw_parts(ptr, cur as usize) }.to_vec();
-                            unsafe { cbuf.Unlock()? };
-                            let is_sync = unsafe { out_s.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-                            output.push((bytes, t, dur, is_sync));
-                        } else {
-                            unsafe { cbuf.Unlock()? };
-                        }
-                    }
-                }
-                Err(e) if e.code() == windows::core::HRESULT(MF_E_TRANSFORM_NEED_MORE_INPUT.0) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    fn reencode_boundary_gop(
+    // Exporta el montaje recodificando con un ÚNICO encoder por hardware: así el clip de salida
+    // tiene un solo SPS/PPS coherente con su avcC. La versión anterior copiaba la mayor parte y
+    // recodificaba solo el GOP del borde con el encoder por software, mezclando dos SPS distintos
+    // bajo un único avcC: el decodificador estricto del editor (WebView2) no podía decodificar el
+    // primer frame y lo mostraba en negro. Recodificar todo con un encoder es además más rápido
+    // que el camino anterior (HW + seek, sin pasadas desde el inicio del archivo). El recorte
+    // sigue siendo exacto al frame: el primer fotograma conservado de cada tramo se vuelve IDR.
+    fn do_export(
         src: &str,
-        edit_in_ms: f64,
-        in_key_ms: f64,
-        next_kf_ms: f64,
-        meta: &VideoMeta,
-    ) -> Result<Vec<H264Packet>> {
-        let reader = open_reader(src)?;
-        let v_idx = find_stream(&reader, MFMediaType_Video)?;
-        unsafe { reader.SetStreamSelection(ALL_STREAMS, false)? };
-        unsafe { reader.SetStreamSelection(v_idx, true)? };
-
-        let nv12 = unsafe { MFCreateMediaType()? };
-        unsafe { nv12.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)? };
-        unsafe { nv12.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)? };
-        unsafe { reader.SetCurrentMediaType(v_idx, None, &nv12)? };
-
-        let (encoder, out_size) =
-            create_h264_encoder(meta.width, meta.height, meta.fps, meta.bitrate)?;
-
-        let edit_hns = (edit_in_ms * 10_000.0) as i64;
-        let first_hns = (in_key_ms * 10_000.0) as i64;
-        let end_hns = (next_kf_ms * 10_000.0) as i64;
-
-        let mut output = Vec::new();
-        let mut samples = Vec::new();
-        let mut first_ts: Option<i64> = None;
-
-        loop {
-            let mut flags = 0u32;
-            let mut sample: Option<IMFSample> = None;
-            unsafe { reader.ReadSample(v_idx, 0, None, Some(&mut flags), None, Some(&mut sample))? };
-            if flags & ENDOFSTREAM != 0 { break; }
-            let Some(sample) = sample else { continue };
-            let t = unsafe { sample.GetSampleTime()? };
-            if t < first_hns { continue; }
-            if t >= end_hns && end_hns > first_hns { break; }
-
-            if t >= edit_hns {
-                if first_ts.is_none() {
-                    unsafe { sample.SetSampleTime(0)? };
-                    first_ts = Some(0);
-                } else {
-                    unsafe { sample.SetSampleTime(t - edit_hns)? };
-                }
-                samples.push(sample);
-            }
-        }
-
-        for sample in &samples {
-            unsafe { encoder.ProcessInput(0, sample, 0)? };
-            pull_encoder_output(&encoder, out_size, &mut output)?;
-        }
-
-        unsafe { encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)? };
-        unsafe { encoder.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
-        pull_encoder_output(&encoder, out_size, &mut output)?;
-
-        Ok(output)
-    }
-
-    fn do_export(src: &str, dst: &str, edit: &ClipEdit) -> std::result::Result<(), String> {
+        dst: &str,
+        edit: &ClipEdit,
+        progress: &dyn Fn(f32),
+    ) -> std::result::Result<(), String> {
         let mf = |e: windows::core::Error| format!("{e:?}");
-
-        let meta = read_video_meta(src).map_err(mf)?;
-        let keyframes = keyframe_times_inner(src)?;
 
         if edit.segments.is_empty() {
             return Err("No hay segmentos para exportar".into());
         }
+        let meta = read_video_meta(src).map_err(mf)?;
+        let keyframes = keyframe_times_inner(src)?;
+        let frame_dur = (10_000_000 / meta.fps.max(1) as i64).max(1);
 
-        let mut all_video = Vec::new();
-        let mut offset = 0i64;
+        // Total de fotogramas a escribir, para el porcentaje del progreso.
+        let total_frames: i64 = edit
+            .segments
+            .iter()
+            .map(|s| (((s.end_ms - s.start_ms).max(0.0) / 1000.0) * meta.fps as f64).round() as i64)
+            .sum::<i64>()
+            .max(1);
 
-        for seg in &edit.segments {
-            let mut packets = extract_video_range(src, seg.start_ms, seg.end_ms, &meta, &keyframes)?;
-            if packets.is_empty() {
-                continue;
-            }
-            for (_, t, _, _) in &mut packets {
-                *t += offset;
-            }
-            if let Some((_, last_t, last_d, _)) = packets.last() {
-                offset = last_t + last_d;
-            }
-            all_video.extend(packets);
-        }
-
-        if all_video.is_empty() {
-            return Err("No hay paquetes de vídeo en los segmentos seleccionados".into());
-        }
-
-        mux_mp4(dst, src, &all_video, edit, &meta)
-            .map_err(|e| format!("Error al multiplexar: {e:?}"))
-    }
-
-    fn extract_param_sets(data: &[u8]) -> Vec<u8> {
-        let mut starts: Vec<usize> = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= data.len() {
-            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                starts.push(i);
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
-        let mut out = Vec::new();
-        for (idx, &s) in starts.iter().enumerate() {
-            let header_pos = s + 3;
-            if header_pos >= data.len() { break; }
-            let sc_start = if s > 0 && data[s - 1] == 0 { s - 1 } else { s };
-            let end = match starts.get(idx + 1) {
-                Some(&ns) if ns > 0 && data[ns - 1] == 0 => ns - 1,
-                Some(&ns) => ns,
-                None => data.len(),
+        // Decodificador de vídeo a NV12. Se configura ANTES de declarar la entrada del encoder para
+        // usar su tipo de salida REAL (stride/apertura incluidos): construir el NV12 a mano solo con
+        // el tamaño dejaba una franja verde arriba por desajuste de geometría entre el buffer del
+        // decodificador y lo que el encoder asumía.
+        // Se decodifica a RGB32 (no NV12) y se deja que el SinkWriter haga RGB→NV12→H.264 con su
+        // propio conversor (el mismo camino que la captura). Alimentar NV12 del decodificador
+        // directamente dejaba una franja verde arriba: 1080 no es múltiplo de 16, el plano luma sale
+        // alineado a 1088 y el encoder leía el plano de croma desfasado. RGB32 no tiene planos de
+        // croma, así que el desajuste desaparece. Requiere "advanced video processing" en el lector.
+        let v_reader = {
+            let attrs = unsafe {
+                let mut a: Option<IMFAttributes> = None;
+                MFCreateAttributes(&mut a, 1).map_err(mf)?;
+                let a = a.unwrap();
+                a.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1).map_err(mf)?;
+                a
             };
-            let nal_type = data[header_pos] & 0x1F;
-            if nal_type == 7 || nal_type == 8 {
-                out.extend_from_slice(&data[sc_start..end]);
-            }
-        }
-        out
-    }
-
-    fn blob(mt: &IMFAttributes, key: &GUID) -> Option<Vec<u8>> {
+            let url = HSTRING::from(src);
+            unsafe { MFCreateSourceReaderFromURL(&url, &attrs).map_err(mf)? }
+        };
+        let v_idx = find_stream(&v_reader, MFMediaType_Video).map_err(mf)?;
+        unsafe { v_reader.SetStreamSelection(ALL_STREAMS, false).map_err(mf)? };
+        unsafe { v_reader.SetStreamSelection(v_idx, true).map_err(mf)? };
+        let rgb = unsafe { MFCreateMediaType().map_err(mf)? };
         unsafe {
-            let size = mt.GetBlobSize(key).ok()?;
-            if size == 0 { return None; }
-            let mut v = vec![0u8; size as usize];
-            mt.GetBlob(key, &mut v, None).ok()?;
-            Some(v)
+            rgb.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(mf)?;
+            rgb.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).map_err(mf)?;
+            rgb.SetUINT64(&MF_MT_FRAME_SIZE, pack2(meta.width, meta.height)).map_err(mf)?;
+            v_reader.SetCurrentMediaType(v_idx, None, &rgb).map_err(mf)?;
         }
-    }
+        let v_in = unsafe { v_reader.GetCurrentMediaType(v_idx).map_err(mf)? };
+        unsafe { v_in.SetUINT64(&MF_MT_FRAME_RATE, pack2(meta.fps, 1)).map_err(mf)? };
 
-    fn mux_mp4(
-        dst: &str,
-        src: &str,
-        video: &[H264Packet],
-        edit: &ClipEdit,
-        meta: &VideoMeta,
-    ) -> Result<()> {
-        let src_reader = open_reader(src)?;
+        // SinkWriter con transformaciones por hardware habilitadas: usa el encoder H.264 por
+        // hardware si está disponible (el mismo tipo que la captura), con fallback a software.
+        let sink_attrs = unsafe {
+            let mut a: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut a, 2).map_err(mf)?;
+            let a = a.unwrap();
+            a.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).map_err(mf)?;
+            a.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1).map_err(mf)?;
+            a
+        };
+        let dst_url = HSTRING::from(dst);
+        let sink: IMFSinkWriter =
+            unsafe { MFCreateSinkWriterFromURL(&dst_url, None, &sink_attrs).map_err(mf)? };
 
-        let v_idx = find_stream(&src_reader, MFMediaType_Video)?;
-        let v_cur = unsafe { src_reader.GetCurrentMediaType(v_idx)? };
-        let seq_header = blob(&v_cur, &MF_MT_MPEG_SEQUENCE_HEADER)
-            .or_else(|| video.first().map(|(data, _, _, _)| extract_param_sets(data)))
-            .unwrap_or_default();
+        // Vídeo: entrada NV12 (lo que entrega el decodificador) → salida H.264.
+        let v_out = unsafe { MFCreateMediaType().map_err(mf)? };
+        unsafe {
+            v_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(mf)?;
+            v_out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(mf)?;
+            v_out.SetUINT64(&MF_MT_FRAME_SIZE, pack2(meta.width, meta.height)).map_err(mf)?;
+            v_out.SetUINT64(&MF_MT_FRAME_RATE, pack2(meta.fps, 1)).map_err(mf)?;
+            v_out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(mf)?;
+            v_out.SetUINT32(&MF_MT_AVG_BITRATE, meta.bitrate).map_err(mf)?;
+        }
+        let v_stream = unsafe { sink.AddStream(&v_out).map_err(mf)? };
+        // Entrada del encoder = tipo de salida REAL del decodificador (ver arriba): evita la franja verde.
+        unsafe { sink.SetInputMediaType(v_stream, &v_in, None).map_err(mf)? };
 
-        // Audio: con 2+ pistas (sistema, micro) se rehornea desde sistema+micro a AAC.
-        // Si solo 1 pista (sin micro), se decodifica la pista a PCM y se recodifica.
+        // Audio: con micro (2 pistas) se rehornea la mezcla sistema+micro; si solo hay una pista
+        // embebida, se decodifica a PCM y el SinkWriter la recodifica (con el volumen del fader).
+        let src_reader = open_reader(src).map_err(mf)?;
         let has_mic = count_audio_streams(src).map(|n| n >= 2).unwrap_or(false);
-        let remixed = if has_mic { Some(build_remixed_pcm(src, edit)?) } else { None };
+        let remixed = if has_mic { Some(build_remixed_pcm(src, edit).map_err(mf)?) } else { None };
         let a_idx = if has_mic { None } else { find_stream(&src_reader, MFMediaType_Audio).ok() };
 
-        let dst_url = HSTRING::from(dst);
-        let sink: IMFSinkWriter = unsafe { MFCreateSinkWriterFromURL(&dst_url, None, None)? };
-
-        let v_type = unsafe { MFCreateMediaType()? };
-        unsafe { v_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)? };
-        unsafe { v_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)? };
-        unsafe { v_type.SetUINT64(&MF_MT_FRAME_SIZE, pack2(meta.width, meta.height))? };
-        unsafe { v_type.SetUINT64(&MF_MT_FRAME_RATE, pack2(meta.fps, 1))? };
-        unsafe { v_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)? };
-        unsafe { v_type.SetUINT32(&MF_MT_AVG_BITRATE, meta.bitrate)? };
-        if !seq_header.is_empty() {
-            unsafe { v_type.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &seq_header)? };
-        }
-        let v_stream = unsafe { sink.AddStream(&v_type)? };
-        unsafe { sink.SetInputMediaType(v_stream, &v_type, None)? };
-
-        let mut pass_stream = None;
         let mut remix_stream = None;
+        let mut pass_stream = None;
         if let Some((_, rate)) = &remixed {
-            remix_stream = Some(add_remix_audio_stream(&sink, *rate)?);
+            remix_stream = Some(add_remix_audio_stream(&sink, *rate).map_err(mf)?);
         } else if let Some(a_idx) = a_idx {
-            // ponytail: en vez de passthrough AAC (falla por falta de AudioSpecificConfig
-            // en el muxer MP4), se decodifica a PCM y se deja que el SinkWriter recodifique.
-            // Leer el tipo nativo para no pedirle al decoder algo que no puede dar
-            // (ej. upmix de mono a estéreo).
             let native_ch = unsafe {
                 src_reader.GetNativeMediaType(a_idx, 0)
                     .ok()
                     .and_then(|mt| mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok())
                     .unwrap_or(2)
             };
-            let pcm_type = unsafe { MFCreateMediaType()? };
+            let pcm_type = unsafe { MFCreateMediaType().map_err(mf)? };
             unsafe {
-                pcm_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                pcm_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-                pcm_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, native_ch.min(2))?;
-                src_reader.SetCurrentMediaType(a_idx, None, &pcm_type)?;
+                pcm_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(mf)?;
+                pcm_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(mf)?;
+                pcm_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, native_ch.min(2)).map_err(mf)?;
+                src_reader.SetCurrentMediaType(a_idx, None, &pcm_type).map_err(mf)?;
             }
-            let a_src = unsafe { src_reader.GetCurrentMediaType(a_idx)? };
+            let a_src = unsafe { src_reader.GetCurrentMediaType(a_idx).map_err(mf)? };
             let sr = unsafe { a_src.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND) }.unwrap_or(48000);
             let ch = unsafe { a_src.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS) }.unwrap_or(2);
-            let a_stream = add_pcm_audio_stream(&sink, sr, ch)?;
+            let a_stream = add_pcm_audio_stream(&sink, sr, ch).map_err(mf)?;
             pass_stream = Some((a_idx, a_stream));
         }
 
-        unsafe { sink.BeginWriting()? };
+        unsafe { sink.BeginWriting().map_err(mf)? };
 
-        for (data, ts_hns, dur_hns, is_sync) in video {
-            let sample = unsafe { MFCreateSample()? };
-            let buf = unsafe { MFCreateMemoryBuffer(data.len() as u32)? };
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            unsafe { buf.Lock(&mut ptr, None, None)? };
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
-            unsafe { buf.Unlock()? };
-            unsafe { buf.SetCurrentLength(data.len() as u32)? };
-            unsafe { sample.AddBuffer(&buf)? };
-            unsafe { sample.SetSampleTime(*ts_hns)? };
-            unsafe { sample.SetSampleDuration(*dur_hns)? };
-            if *is_sync {
-                unsafe { sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)? };
+        // --- Vídeo: recodificar solo los tramos conservados (el decodificador ya está en NV12) ---
+        let mut kept_before: i64 = 0;
+        let mut written: i64 = 0;
+        for seg in &edit.segments {
+            let start_hns = (seg.start_ms * 10_000.0) as i64;
+            let end_hns = (seg.end_ms * 10_000.0) as i64;
+            if end_hns <= start_hns {
+                continue;
             }
-            unsafe { sink.WriteSample(v_stream, &sample)? };
-        }
-
-        if let Some(a_stream) = remix_stream {
-            let (mixed, rate) = remixed.as_ref().unwrap();
-            write_remixed_audio(&sink, a_stream, mixed, *rate, edit)?;
-        } else if let Some((a_idx, a_stream)) = pass_stream {
-            unsafe { src_reader.SetStreamSelection(ALL_STREAMS, false)? };
-            unsafe { src_reader.SetStreamSelection(a_idx, true)? };
-
-            // Pista única embebida: aplicar el volumen/silencio del fader (sys) al PCM antes de
-            // recodificar, para que el export coincida con lo que se oye en el editor.
-            let sys_gain = if edit.mixer.sys_muted { 0.0f32 } else { edit.mixer.sys_vol };
-
-            let seg_ranges: Vec<(i64, i64, i64)> = {
-                let mut kept_before = 0i64;
-                edit.segments.iter().map(|seg| {
-                    let start_hns = (seg.start_ms * 10_000.0) as i64;
-                    let end_hns = (seg.end_ms * 10_000.0) as i64;
-                    let offset = start_hns - kept_before;
-                    kept_before += end_hns - start_hns;
-                    (start_hns, end_hns, offset)
-                }).collect()
-            };
-
-            let mut seg_idx = 0usize;
+            // Posicionar el lector en el keyframe anterior al inicio del tramo: decodifica desde ahí
+            // (necesario para las referencias) pero solo se escriben los frames a partir del corte,
+            // así el recorte es exacto al frame sin exportar nada que el usuario no quería.
+            let kf = keyframes.iter().rev().find(|k| **k <= seg.start_ms).copied().unwrap_or(0.0);
+            let pos = PROPVARIANT::from((kf * 10_000.0) as i64);
+            unsafe { v_reader.SetCurrentPosition(&GUID::zeroed(), &pos).map_err(mf)? };
 
             loop {
                 let mut flags = 0u32;
                 let mut sample: Option<IMFSample> = None;
-                unsafe { src_reader.ReadSample(a_idx, 0, None, Some(&mut flags), None, Some(&mut sample))? };
+                unsafe {
+                    v_reader.ReadSample(v_idx, 0, None, Some(&mut flags), None, Some(&mut sample)).map_err(mf)?;
+                }
                 if flags & ENDOFSTREAM != 0 { break; }
                 let Some(sample) = sample else { continue };
-                let t = unsafe { sample.GetSampleTime()? };
+                let t = unsafe { sample.GetSampleTime().map_err(mf)? };
+                if t < start_hns { continue; }
+                if t >= end_hns { break; }
+                // Re-tiempo al hueco eliminado, idéntico al del audio: los tramos se concatenan sin
+                // huecos en la salida (mismo mapeo origen→salida que el audio para mantener el sync).
+                let out_t = (t - start_hns) + kept_before;
+                unsafe {
+                    sample.SetSampleTime(out_t).map_err(mf)?;
+                    sample.SetSampleDuration(frame_dur).map_err(mf)?;
+                    sink.WriteSample(v_stream, &sample).map_err(mf)?;
+                }
+                written += 1;
+                if written % 10 == 0 {
+                    progress((written as f32 / total_frames as f32).min(0.97));
+                }
+            }
+            kept_before += end_hns - start_hns;
+        }
 
+        // --- Audio ---
+        if let Some(a_stream) = remix_stream {
+            let (mixed, rate) = remixed.as_ref().unwrap();
+            write_remixed_audio(&sink, a_stream, mixed, *rate, edit).map_err(mf)?;
+        } else if let Some((a_idx, a_stream)) = pass_stream {
+            unsafe { src_reader.SetStreamSelection(ALL_STREAMS, false).map_err(mf)? };
+            unsafe { src_reader.SetStreamSelection(a_idx, true).map_err(mf)? };
+            let sys_gain = if edit.mixer.sys_muted { 0.0f32 } else { edit.mixer.sys_vol };
+            let seg_ranges: Vec<(i64, i64, i64)> = {
+                let mut kept = 0i64;
+                edit.segments.iter().map(|seg| {
+                    let s = (seg.start_ms * 10_000.0) as i64;
+                    let e = (seg.end_ms * 10_000.0) as i64;
+                    let offset = s - kept;
+                    kept += e - s;
+                    (s, e, offset)
+                }).collect()
+            };
+            let mut seg_idx = 0usize;
+            loop {
+                let mut flags = 0u32;
+                let mut sample: Option<IMFSample> = None;
+                unsafe { src_reader.ReadSample(a_idx, 0, None, Some(&mut flags), None, Some(&mut sample)).map_err(mf)? };
+                if flags & ENDOFSTREAM != 0 { break; }
+                let Some(sample) = sample else { continue };
+                let t = unsafe { sample.GetSampleTime().map_err(mf)? };
                 while seg_idx < seg_ranges.len() && t >= seg_ranges[seg_idx].1 {
                     seg_idx += 1;
                 }
                 if seg_idx >= seg_ranges.len() { break; }
-
                 let (start_hns, _end_hns, offset) = seg_ranges[seg_idx];
                 if t >= start_hns {
-                    unsafe { sample.SetSampleTime(t - offset)? };
+                    unsafe { sample.SetSampleTime(t - offset).map_err(mf)? };
                     if (sys_gain - 1.0).abs() > 1e-3 {
-                        apply_gain_pcm16(&sample, sys_gain)?;
+                        apply_gain_pcm16(&sample, sys_gain).map_err(mf)?;
                     }
-                    unsafe { sink.WriteSample(a_stream, &sample)? };
+                    unsafe { sink.WriteSample(a_stream, &sample).map_err(mf)? };
                 }
             }
         }
 
-        unsafe { sink.Finalize()? };
+        progress(0.99);
+        unsafe { sink.Finalize().map_err(mf)? };
+        progress(1.0);
         Ok(())
     }
 

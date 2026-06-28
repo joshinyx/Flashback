@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -14,10 +14,21 @@ pub struct ClipInfo {
     pub source: String,
 }
 
-pub fn list_clips(dir: PathBuf) -> Vec<ClipInfo> {
+pub fn list_clips(dirs: Vec<PathBuf>) -> Vec<ClipInfo> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
+    for dir in dirs {
+        scan_dir(&dir, &mut out);
+    }
+    // Dedup por ruta por si dos carpetas escaneadas se solapan; se conserva la primera.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|c| seen.insert(c.path.to_lowercase()));
+    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    out
+}
+
+fn scan_dir(dir: &Path, out: &mut Vec<ClipInfo>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -48,12 +59,7 @@ pub fn list_clips(dir: PathBuf) -> Vec<ClipInfo> {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let sidecar_path = path.with_extension("clip.json");
-        let source = std::fs::read_to_string(&sidecar_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("source")?.as_str().map(String::from))
-            .unwrap_or_default();
+        let source = clip_source(&path).unwrap_or_default();
         out.push(ClipInfo {
             id,
             name,
@@ -64,8 +70,6 @@ pub fn list_clips(dir: PathBuf) -> Vec<ClipInfo> {
             source,
         });
     }
-    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
-    out
 }
 
 // Sidecars que acompañan a cada MP4 (metadato de fuente y edición no destructiva). Renombrar
@@ -74,7 +78,7 @@ const SIDECARS: [&str; 2] = ["clip.json", "edit.json"];
 
 // Renombra el clip (y sus sidecars). Valida el nombre y evita pisar otro clip. Devuelve la
 // nueva ruta del MP4.
-pub fn rename_clip(path: &str, new_name: &str) -> Result<String, String> {
+pub fn rename_clip(path: &str, new_name: &str, edit_index: &Path) -> Result<String, String> {
     let p = Path::new(path);
     let parent = p.parent().ok_or("Ruta inválida")?;
     let name = new_name.trim();
@@ -98,12 +102,16 @@ pub fn rename_clip(path: &str, new_name: &str) -> Result<String, String> {
             let _ = std::fs::rename(&from, new_mp4.with_extension(ext));
         }
     }
-    Ok(new_mp4.to_string_lossy().into_owned())
+    let new_path = new_mp4.to_string_lossy().into_owned();
+    // La edición vive en el índice de app-data, indexada por ruta: re-mapear la entrada al
+    // nuevo nombre para no perder el montaje al renombrar.
+    crate::edits::rekey(edit_index, path, &new_path);
+    Ok(new_path)
 }
 
 // Envía el clip y sus sidecars a la papelera (recuperable). El borrado es la única operación
 // destructiva de la app, así que se usa la papelera del sistema en vez de un borrado directo.
-pub fn delete_clip(path: &str) -> Result<(), String> {
+pub fn delete_clip(path: &str, edit_index: &Path) -> Result<(), String> {
     let p = Path::new(path);
     let mut files = vec![p.to_path_buf()];
     for ext in SIDECARS {
@@ -112,7 +120,9 @@ pub fn delete_clip(path: &str) -> Result<(), String> {
             files.push(s);
         }
     }
-    recycle(&files)
+    recycle(&files)?;
+    crate::edits::remove(edit_index, path);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -226,5 +236,125 @@ fn box_extent(f: &mut File, size32: u32, pos: u64, container_end: u64) -> Option
         1 => Some((read_u64(f)?, 16)),
         0 => Some((container_end - pos, 8)),
         n => Some((n as u64, 8)),
+    }
+}
+
+// Metadatos propios del clip (de momento, solo el origen: juego o monitor) embebidos EN el MP4
+// para que viajen con el archivo sin sidecars. Se guardan en una caja `uuid` de nivel superior
+// (punto de extensión sancionado por ISO-BMFF): los reproductores ignoran las `uuid` que no
+// reconocen y, al ir tras `mdat`, no se altera el vídeo ni las tablas de offsets.
+const FB_META_UUID: [u8; 16] = [
+    0xfb, 0x1a, 0x5b, 0xac, 0x46, 0x4c, 0x41, 0x53, 0x48, 0x42, 0x41, 0x43, 0x4b, 0x4d, 0x44, 0x31,
+];
+
+// Origen del clip (juego/monitor): primero el metadato embebido en el MP4; si no está (clip
+// antiguo), el sidecar `.clip.json` heredado.
+pub fn clip_source(path: &Path) -> Option<String> {
+    read_embedded_source(path).or_else(|| legacy_source(path))
+}
+
+pub fn read_embedded_source(path: &Path) -> Option<String> {
+    let json = read_meta_box(path)?;
+    let v: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    v.get("source")?.as_str().map(String::from)
+}
+
+fn read_meta_box(path: &Path) -> Option<Vec<u8>> {
+    let mut f = File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let mut pos = 0u64;
+    while pos + 8 <= file_len {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        let size32 = read_u32(&mut f)?;
+        let mut typ = [0u8; 4];
+        f.read_exact(&mut typ).ok()?;
+        let (box_size, header) = box_extent(&mut f, size32, pos, file_len)?;
+        if &typ == b"uuid" && box_size >= header + 16 {
+            f.seek(SeekFrom::Start(pos + header)).ok()?;
+            let mut sig = [0u8; 16];
+            if f.read_exact(&mut sig).is_ok() && sig == FB_META_UUID {
+                let payload_len = (box_size - header - 16) as usize;
+                let mut buf = vec![0u8; payload_len];
+                f.read_exact(&mut buf).ok()?;
+                return Some(buf);
+            }
+        }
+        if box_size < header {
+            break;
+        }
+        pos += box_size;
+    }
+    None
+}
+
+pub fn write_embedded_source(path: &Path, source: &str) -> std::io::Result<()> {
+    let payload = serde_json::json!({ "source": source }).to_string();
+    let payload = payload.as_bytes();
+    let size = 8 + 16 + payload.len();
+    let mut bytes = Vec::with_capacity(size);
+    bytes.extend_from_slice(&(size as u32).to_be_bytes());
+    bytes.extend_from_slice(b"uuid");
+    bytes.extend_from_slice(&FB_META_UUID);
+    bytes.extend_from_slice(payload);
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(&bytes)
+}
+
+// Compatibilidad hacia atrás: clips creados antes del metadato embebido guardan el origen en un
+// sidecar `<clip>.clip.json`. Se sigue leyendo si el MP4 no lleva la caja propia.
+fn legacy_source(path: &Path) -> Option<String> {
+    let sidecar = path.with_extension("clip.json");
+    std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("source")?.as_str().map(String::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_clips_aggregates_and_dedupes() {
+        let base = std::env::temp_dir().join(format!("fb_list_test_{}", std::process::id()));
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("one.mp4"), b"\x00\x00\x00\x08ftypisom").unwrap();
+        std::fs::write(b.join("two.mp4"), b"\x00\x00\x00\x08ftypisom").unwrap();
+        std::fs::write(b.join("note.txt"), b"x").unwrap();
+
+        // 'a' repetida: el dedup por ruta evita entradas duplicadas; el .txt se ignora.
+        let clips = list_clips(vec![a.clone(), b.clone(), a.clone()]);
+        let ids: Vec<_> = clips.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(clips.len(), 2, "ids={ids:?}");
+        assert!(ids.contains(&"one.mp4".to_string()));
+        assert!(ids.contains(&"two.mp4".to_string()));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn embedded_source_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("fb_meta_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("clip.mp4");
+        // MP4 mínimo con cajas de nivel superior bien dimensionadas (ftyp + mdat falso): basta para
+        // que el iterador llegue hasta nuestra caja añadida al final.
+        let mut base = Vec::new();
+        base.extend_from_slice(&12u32.to_be_bytes());
+        base.extend_from_slice(b"ftyp");
+        base.extend_from_slice(b"isom");
+        base.extend_from_slice(&16u32.to_be_bytes());
+        base.extend_from_slice(b"mdat");
+        base.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&p, &base).unwrap();
+
+        assert_eq!(read_embedded_source(&p), None);
+        write_embedded_source(&p, "VALORANT").unwrap();
+        assert_eq!(read_embedded_source(&p).as_deref(), Some("VALORANT"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

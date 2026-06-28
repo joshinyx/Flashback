@@ -1,4 +1,5 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import type { Clip } from './clips';
 
 type ClipAudio = {
@@ -63,6 +64,7 @@ export const editorState = $state<{
   fps: number;
   mixer: MixerState;
   exporting: boolean;
+  exportProgress: number;
   sysPeaks: number[] | null;
   micPeaks: number[] | null;
   mixPeaks: number[] | null;
@@ -80,6 +82,7 @@ export const editorState = $state<{
   fps: 30,
   mixer: { ...defaultMixer },
   exporting: false,
+  exportProgress: 0,
   sysPeaks: null,
   micPeaks: null,
   mixPeaks: null,
@@ -103,6 +106,7 @@ function resetEditorState() {
   editorState.fps = 30;
   editorState.mixer = { ...defaultMixer };
   editorState.exporting = false;
+  editorState.exportProgress = 0;
   editorState.sysPeaks = null;
   editorState.micPeaks = null;
   editorState.mixPeaks = null;
@@ -187,10 +191,15 @@ export async function exportClip() {
   const segments = serializeSegments(true);
   if (segments.length === 0) throw new Error('No hay bloques activos para exportar');
   editorState.exporting = true;
+  editorState.exportProgress = 0;
+  // El backend emite el progreso (0..1) durante la recodificación; lo reflejamos en el popup.
+  const unlisten = await listen<number>('export-progress', (e) => {
+    editorState.exportProgress = e.payload;
+  });
   try {
     const src = editorState.clip.path;
-    const dot = src.lastIndexOf('.');
-    const dst = dot > 0 ? `${src.slice(0, dot)}_edit.mp4` : `${src}_edit.mp4`;
+    // El backend decide el destino: los clips editados van a su carpeta dedicada (Clips-Edit).
+    const dst = await invoke<string>('edit_dest', { src });
 
     await invoke('export_clip', {
       src,
@@ -204,7 +213,9 @@ export async function exportClip() {
   } catch (e) {
     throw e;
   } finally {
+    unlisten();
     editorState.exporting = false;
+    editorState.exportProgress = 0;
   }
 }
 

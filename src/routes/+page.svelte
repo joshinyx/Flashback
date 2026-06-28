@@ -1,12 +1,13 @@
 <script lang="ts">
   import Icon from '$lib/components/Icon.svelte';
   import ClipCard from '$lib/components/ClipCard.svelte';
-  import { groupClips } from '$lib/clips';
+  import LibraryFilter from '$lib/components/LibraryFilter.svelte';
+  import { groupClips, clipMatchesFilters, type LibraryFilter as Filter } from '$lib/clips';
   import { library, refreshLibrary } from '$lib/library.svelte';
   import { clipOrder } from '$lib/editor.svelte';
 
   let query = $state('');
-  let view = $state<'grid' | 'list'>('grid');
+  let filters = $state<Filter[]>([]);
 
   $effect(() => {
     refreshLibrary();
@@ -15,7 +16,8 @@
   const filtered = $derived(
     library.clips.filter((c) => {
       const q = query.trim().toLowerCase();
-      return !q || c.title.toLowerCase().includes(q) || c.source.toLowerCase().includes(q);
+      const matchesQuery = !q || c.title.toLowerCase().includes(q) || c.source.toLowerCase().includes(q);
+      return matchesQuery && clipMatchesFilters(c, filters);
     })
   );
   const groups = $derived(groupClips(filtered));
@@ -41,22 +43,11 @@
         <Icon name="search" size={15} />
         <input placeholder="Buscar clips" bind:value={query} />
       </label>
-      <button class="ctrl">
-        <Icon name="filter" size={14} />
-        Filtro
-      </button>
+      <LibraryFilter clips={library.clips} bind:selected={filters} />
       <button class="ctrl">
         Más reciente
         <Icon name="chevron-down" size={13} sw={2} />
       </button>
-      <div class="viewtoggle">
-        <button class:on={view === 'grid'} aria-label="Cuadrícula" onclick={() => (view = 'grid')}>
-          <Icon name="clips" size={16} />
-        </button>
-        <button class:on={view === 'list'} aria-label="Lista" onclick={() => (view = 'list')}>
-          <Icon name="list" size={16} />
-        </button>
-      </div>
     </div>
   </header>
 
@@ -69,7 +60,7 @@
   {:else if filtered.length === 0}
     <div class="empty">
       <Icon name="chevrons" size={56} sw={1.2} />
-      <p>Sin resultados para “{query}”.</p>
+      <p>{query ? `Sin resultados para “${query}”.` : 'Sin resultados con este filtro.'}</p>
     </div>
   {:else}
     {#each groups as group (group.label)}
@@ -77,9 +68,8 @@
         <div class="group-head">
           <span class="label">{group.label}</span>
           <span class="dash"></span>
-          {#if group.source}<span class="label src">{group.source}</span>{/if}
         </div>
-        <div class="grid" class:list={view === 'list'}>
+        <div class="grid">
           {#each group.clips as clip (clip.id)}
             <ClipCard {clip} />
           {/each}
@@ -181,31 +171,6 @@
     color: var(--text-0);
     border-color: var(--line-strong);
   }
-  .viewtoggle {
-    display: flex;
-    padding: 3px;
-    gap: 2px;
-    background: var(--bg-1);
-    border: 1px solid var(--line);
-    border-radius: var(--r-sm);
-  }
-  .viewtoggle button {
-    width: 30px;
-    height: 28px;
-    display: grid;
-    place-items: center;
-    border-radius: 5px;
-    color: var(--text-2);
-    transition: color 0.14s ease, background 0.14s ease;
-  }
-  .viewtoggle button:hover {
-    color: var(--bright);
-  }
-  .viewtoggle button.on {
-    color: var(--bright);
-    background: var(--bg-3);
-  }
-
   .group {
     margin-bottom: 30px;
   }
@@ -215,9 +180,6 @@
     gap: 12px;
     margin-bottom: 14px;
   }
-  .src {
-    color: var(--text-3);
-  }
   .dash {
     flex: 1;
     height: 1px;
@@ -226,16 +188,13 @@
 
   .grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 20px;
   }
   @media (min-width: 1280px) {
-    .grid:not(.list) {
-      grid-template-columns: repeat(3, 1fr);
+    .grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
     }
-  }
-  .grid.list {
-    grid-template-columns: minmax(0, 760px);
   }
 
   .empty {

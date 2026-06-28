@@ -1041,7 +1041,7 @@
               {#if editorState.mic}
                 {@render fader('mic', editorState.mixer.mic_vol, editorState.mixer.mic_muted, 'Audio del micrófono', 'mic')}
               {/if}
-              {@render fader('sys', editorState.mixer.sys_vol, editorState.mixer.sys_muted, editorState.system ? 'Audio del sistema' : 'Audio', 'headphones')}
+              {@render fader('sys', editorState.mixer.sys_vol, editorState.mixer.sys_muted, editorState.system ? 'Audio del sistema' : 'Audio', editorState.system ? 'headphones' : 'speaker')}
             {/if}
           </div>
         </div>
@@ -1101,6 +1101,18 @@
         {editorState.segments[blockMenu.index]?.disabled ? 'Activar' : 'Desactivar'}
       </button>
       <button class="ctx-item danger" onclick={deleteBlock} disabled={editorState.segments.length <= 1}>Eliminar</button>
+    </div>
+  {/if}
+
+  {#if editorState.exporting}
+    <div class="export-backdrop">
+      <div class="export-card">
+        <div class="export-title">Exportando clip…</div>
+        <div class="export-bar">
+          <div class="export-fill" style="width: {Math.max(2, Math.round(editorState.exportProgress * 100))}%"></div>
+        </div>
+        <div class="export-pct mono">{Math.round(editorState.exportProgress * 100)}%</div>
+      </div>
     </div>
   {/if}
 </div>
@@ -1622,6 +1634,54 @@
   .fader-ico.on { color: var(--rec); }
   .fader.muted .fader-rail { opacity: 0.4; }
   .alanes { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+
+  /* Popup de progreso de exportación: bloquea la interacción mientras recodifica. */
+  .export-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 300;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(2px);
+  }
+  .export-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    width: 320px;
+    max-width: 80%;
+    padding: 24px 26px;
+    background: var(--bg-2);
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    box-shadow: 0 20px 48px -12px rgba(0, 0, 0, 0.75);
+  }
+  .export-title {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-1);
+  }
+  .export-bar {
+    width: 100%;
+    height: 8px;
+    border-radius: 99px;
+    background: var(--bg-0);
+    overflow: hidden;
+  }
+  .export-fill {
+    height: 100%;
+    border-radius: 99px;
+    background: var(--bright);
+    transition: width 0.2s ease;
+  }
+  .export-pct {
+    font-size: 12px;
+    color: var(--text-1);
+    font-variant-numeric: tabular-nums;
+  }
 
   /* Menú contextual del bloque (clic derecho). El backdrop captura el clic fuera para cerrarlo. */
   .ctx-backdrop { position: fixed; inset: 0; z-index: 200; }

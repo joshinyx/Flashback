@@ -72,6 +72,8 @@ function toClip(r: RawClip): Clip {
     sizeBytes: r.size_bytes,
     createdAt: new Date(r.modified_ms),
     path: r.path,
+    // Los clips exportados desde el editor se nombran `<nombre>_edit.mp4`.
+    edited: r.id.endsWith('_edit.mp4'),
     previewSrc: convertFileSrc(r.path)
   };
 }

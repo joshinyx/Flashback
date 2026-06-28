@@ -2,8 +2,10 @@ mod artwork;
 #[cfg(target_os = "windows")]
 mod audio;
 mod capture;
+mod config;
 mod detect;
 mod editor;
+mod edits;
 mod library;
 #[cfg(target_os = "windows")]
 mod overlay;
@@ -44,16 +46,10 @@ fn start_capture(
     mic: bool,
     mic_device: String,
 ) -> Result<(), String> {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("clips");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = config::clips_dir(&app).to_string_lossy().into_owned();
     capture::start(
         target,
-        dir.to_string_lossy().into_owned(),
+        dir,
         fps,
         quality,
         resolution,
@@ -85,16 +81,10 @@ fn start_replay(
     mic: bool,
     mic_device: String,
 ) -> Result<(), String> {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("clips");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = config::clips_dir(&app).to_string_lossy().into_owned();
     capture::start_replay(
         target,
-        dir.to_string_lossy().into_owned(),
+        dir,
         seconds,
         fps,
         quality,
@@ -133,14 +123,23 @@ async fn prepare_clip_audio(app: tauri::AppHandle, path: String) -> Result<edito
         .map_err(|e| format!("Error interno: {e}"))?
 }
 
-#[tauri::command]
-fn load_clip_edit(path: String) -> Result<editor::ClipEdit, String> {
-    editor::load_edit(path)
+fn edit_index(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("edits.json"))
 }
 
 #[tauri::command]
-fn save_clip_edit(path: String, edit: editor::ClipEdit) -> Result<(), String> {
-    editor::save_edit(path, edit)
+fn load_clip_edit(app: tauri::AppHandle, path: String) -> Result<editor::ClipEdit, String> {
+    editor::load_edit(edit_index(&app)?.to_string_lossy().into_owned(), path)
+}
+
+#[tauri::command]
+fn save_clip_edit(app: tauri::AppHandle, path: String, edit: editor::ClipEdit) -> Result<(), String> {
+    editor::save_edit(edit_index(&app)?.to_string_lossy().into_owned(), path, edit)
 }
 
 #[tauri::command]
@@ -165,10 +164,20 @@ async fn clip_fps(path: String) -> Result<u32, String> {
 }
 
 #[tauri::command]
-async fn export_clip(src: String, dst: String, edit: editor::ClipEdit) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || editor::export_clip(src, dst, edit))
-        .await
-        .map_err(|e| format!("Error interno: {e}"))?
+async fn export_clip(
+    app: tauri::AppHandle,
+    src: String,
+    dst: String,
+    edit: editor::ClipEdit,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    tokio::task::spawn_blocking(move || {
+        editor::export_clip(src, dst, edit, move |p: f32| {
+            let _ = app.emit("export-progress", p);
+        })
+    })
+    .await
+    .map_err(|e| format!("Error interno: {e}"))?
 }
 
 #[tauri::command]
@@ -194,13 +203,7 @@ async fn clip_thumbnail(app: tauri::AppHandle, path: String) -> Result<String, S
 
 #[tauri::command]
 async fn capture_frame(app: tauri::AppHandle, path: String, time_ms: f64) -> Result<String, String> {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("screenshots");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = config::screenshots_dir(&app);
     tokio::task::spawn_blocking(move || -> Result<String, String> {
         let stem = std::path::Path::new(&path)
             .file_stem()
@@ -218,24 +221,48 @@ async fn capture_frame(app: tauri::AppHandle, path: String, time_ms: f64) -> Res
 }
 
 #[tauri::command]
-fn rename_clip(path: String, new_name: String) -> Result<String, String> {
-    library::rename_clip(&path, &new_name)
+fn rename_clip(app: tauri::AppHandle, path: String, new_name: String) -> Result<String, String> {
+    library::rename_clip(&path, &new_name, &edit_index(&app)?)
 }
 
 #[tauri::command]
-fn delete_clip(path: String) -> Result<(), String> {
-    library::delete_clip(&path)
+fn delete_clip(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    library::delete_clip(&path, &edit_index(&app)?)
 }
 
 #[tauri::command]
 fn list_clips(app: tauri::AppHandle) -> Vec<library::ClipInfo> {
-    use tauri::Manager;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map(|d| d.join("clips"))
-        .unwrap_or_default();
-    library::list_clips(dir)
+    library::list_clips(config::library_dirs(&app))
+}
+
+#[tauri::command]
+fn clips_dir(app: tauri::AppHandle) -> String {
+    config::clips_dir(&app).to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn set_clips_dir(app: tauri::AppHandle, dir: String) -> Result<(), String> {
+    config::set_clips_dir(&app, &dir)
+}
+
+#[tauri::command]
+async fn pick_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(config::pick_folder)
+        .await
+        .map_err(|e| format!("Error interno: {e}"))?
+}
+
+// Destino de exportación: los clips editados van a su carpeta dedicada, no junto al original.
+#[tauri::command]
+fn edit_dest(app: tauri::AppHandle, src: String) -> String {
+    let stem = std::path::Path::new(&src)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clip");
+    config::clips_edit_dir(&app)
+        .join(format!("{stem}_edit.mp4"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -315,6 +342,9 @@ pub fn run() {
             #[cfg(desktop)]
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
+            // Permitir al protocolo asset leer las carpetas de clips y capturas (pueden estar fuera
+            // de app_data), o el editor no podría reproducir/leer los archivos guardados ahí.
+            config::allow_asset_scopes(app.handle());
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_min_size(Some(tauri::LogicalSize { width: 1200.0, height: 675.0 }));
                 let _ = w.set_size(tauri::LogicalSize { width: 1200.0, height: 675.0 });
@@ -374,6 +404,10 @@ pub fn run() {
             stop_capture,
             capture_status,
             list_clips,
+            clips_dir,
+            set_clips_dir,
+            pick_folder,
+            edit_dest,
             prepare_clip_audio,
             load_clip_edit,
             save_clip_edit,
