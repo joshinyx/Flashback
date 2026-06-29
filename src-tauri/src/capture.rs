@@ -114,7 +114,7 @@ mod win {
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
-    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT, SYSTEMTIME};
+    use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, LPARAM, RECT, SYSTEMTIME};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
@@ -135,6 +135,10 @@ mod win {
     };
     use windows::Win32::Media::MediaFoundation::*;
     use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+    use windows::Win32::System::Threading::{
+        AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+        AVRT_PRIORITY_HIGH,
+    };
 
     // Valor Win32 de MONITORINFOF_PRIMARY (no lo genera el crate windows).
     const MONITORINFOF_PRIMARY: u32 = 1;
@@ -333,6 +337,7 @@ mod win {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let _timer = TimerRes::new();
+        let _mmcss = MmcssTask::new("Capture");
 
         let mut engine = match resolve_target_item(&target).and_then(|item| {
             build_engine(
@@ -1251,6 +1256,7 @@ mod win {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let _timer = TimerRes::new();
+        let _mmcss = MmcssTask::new("Capture");
 
         let _ = seconds;
 
@@ -3023,6 +3029,38 @@ mod win {
     impl Drop for TimerRes {
         fn drop(&mut self) {
             unsafe { timeEndPeriod(1) };
+        }
+    }
+
+    // MMCSS: registra el hilo actual en el Multimedia Class Scheduler Service. Sin esto, el hilo
+    // de bombeo es de prioridad normal y un juego a pantalla completa que satura los núcleos lo
+    // dejaba sin CPU ~1 s en ráfagas de carga: el reloj de cadencia seguía corriendo y el resync
+    // tapaba el atraso saltando ~1 s, dejando congelaciones y tirones en el clip. MMCSS le
+    // garantiza scheduling frente al juego. Se revierte al terminar el hilo. Best-effort: si
+    // avrt falla, se sigue sin la garantía antes que abortar la captura (CLAUDE.md §4.4).
+    struct MmcssTask(HANDLE);
+
+    impl MmcssTask {
+        fn new(task: &str) -> Option<MmcssTask> {
+            let name = HSTRING::from(task);
+            let mut idx = 0u32;
+            match unsafe { AvSetMmThreadCharacteristicsW(PCWSTR(name.as_ptr()), &mut idx) } {
+                Ok(h) if !h.is_invalid() => {
+                    let _ = unsafe { AvSetMmThreadPriority(h, AVRT_PRIORITY_HIGH) };
+                    Some(MmcssTask(h))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("mmcss: no se pudo registrar el hilo en '{task}': {e:?}");
+                    None
+                }
+            }
+        }
+    }
+
+    impl Drop for MmcssTask {
+        fn drop(&mut self) {
+            let _ = unsafe { AvRevertMmThreadCharacteristics(self.0) };
         }
     }
 

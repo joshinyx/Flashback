@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 
 
 use windows::core::{Result, GUID, HSTRING, PCWSTR};
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -22,7 +22,10 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
+    CreateEventW, WaitForSingleObject, AVRT_PRIORITY_HIGH,
+};
 
 const WAVE_FORMAT_IEEE_FLOAT_TAG: u16 = 3;
 const WAVE_FORMAT_EXTENSIBLE_TAG: u16 = 0xFFFE;
@@ -126,6 +129,34 @@ pub fn probe_format(kind: &TrackKind) -> Option<(u32, u16)> {
     Some((rate, channels))
 }
 
+// MMCSS para el hilo de audio: lo saca de la prioridad normal (starvable) y lo pone bajo el
+// Multimedia Class Scheduler Service, que le garantiza CPU frente a un juego a pantalla
+// completa. Mismo patrón que capture.rs (guard RAII que revierte al soltar). Duplicado a
+// propósito para no acoplar el módulo de audio con el de captura (CLAUDE.md §4).
+struct MmcssGuard(HANDLE);
+
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { AvRevertMmThreadCharacteristics(self.0) };
+    }
+}
+
+fn mmcss_register(task: &str) -> Option<MmcssGuard> {
+    let name = HSTRING::from(task);
+    let mut idx = 0u32;
+    match unsafe { AvSetMmThreadCharacteristicsW(PCWSTR(name.as_ptr()), &mut idx) } {
+        Ok(h) if !h.is_invalid() => {
+            let _ = unsafe { AvSetMmThreadPriority(h, AVRT_PRIORITY_HIGH) };
+            Some(MmcssGuard(h))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("mmcss: no se pudo registrar el hilo de audio en '{task}': {e:?}");
+            None
+        }
+    }
+}
+
 pub fn spawn_track(
     kind: TrackKind,
     encoding: Encoding,
@@ -142,6 +173,11 @@ pub fn spawn_track(
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
+            // MMCSS: el hilo de audio sostiene el lock del ring buffer al empujar paquetes; si
+            // un juego a pantalla completa lo deja sin CPU, el pump de vídeo (alta prioridad) se
+            // bloquea esperando ese lock (inversión de prioridad). Registrarlo en "Pro Audio" le
+            // garantiza scheduling y evita arrastrar al pump. Best-effort (ver capture.rs).
+            let _mmcss = mmcss_register("Pro Audio");
             // Si el dispositivo no abre (sin micrófono, endpoint desconectado, etc.) el
             // hilo termina sin más: el sink no recibe nada, pero no compromete el resto
             // de la captura (CLAUDE.md §4.4).
