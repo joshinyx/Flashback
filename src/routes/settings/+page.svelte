@@ -1,5 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { getVersion } from '@tauri-apps/api/app';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import Icon from '$lib/components/Icon.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { refreshLibrary } from '$lib/library.svelte';
@@ -46,12 +48,18 @@
 
   let folder = $state('');
   let changingFolder = $state(false);
+  let appVersion = $state('');
   $effect(() => {
     invoke<string>('clips_dir').then((d) => (folder = d)).catch(() => {});
     invoke<string>('get_encoder').then((e) => {
       if (ENCODER_OPTIONS.includes(e as EncoderOption)) encoder = e as EncoderOption;
     }).catch(() => {});
+    getVersion().then((v) => (appVersion = v)).catch(() => {});
   });
+
+  function openLink(url: string) {
+    openUrl(url).catch(() => {});
+  }
 
   function setEncoder(opt: EncoderOption) {
     encoder = opt;
@@ -254,6 +262,29 @@
       </div>
     {/each}
   </section>
+
+  <section class="panel">
+    <span class="label panel-title">Acerca de</span>
+    <div class="about-head">
+      <img class="about-logo" src="/flashback-mono.svg" alt="" />
+      <div class="about-id">
+        <span class="about-name">Flashback{#if appVersion}<span class="about-ver mono">v{appVersion}</span>{/if}</span>
+        <span class="about-desc">Captura y edición ligera de clips de juego para Windows.</span>
+      </div>
+    </div>
+    <div class="setting">
+      <div class="info"><h3>Desarrollado por</h3></div>
+      <button class="about-link" onclick={() => openLink('https://joshiny.dev')}>Josh Bernal</button>
+    </div>
+    <div class="setting">
+      <div class="info"><h3>Licencia</h3></div>
+      <span class="about-val mono">GPL-3.0-only</span>
+    </div>
+    <div class="setting">
+      <div class="info"><h3>Código fuente</h3></div>
+      <button class="about-link" onclick={() => openLink('https://github.com/kuzpire/Flashback')}>kuzpire/Flashback</button>
+    </div>
+  </section>
 </div>
 
 <style>
@@ -452,5 +483,53 @@
   }
   .play-btn:active {
     transform: scale(0.96);
+  }
+
+  .about-head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 18px 0;
+  }
+  .about-logo {
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+  }
+  .about-id {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .about-name {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-0);
+  }
+  .about-ver {
+    margin-left: 7px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-2);
+  }
+  .about-desc {
+    font-size: 12.5px;
+    color: var(--text-2);
+  }
+  .about-link {
+    flex-shrink: 0;
+    font-size: 13px;
+    color: var(--accent-soft);
+    transition: color 0.15s ease;
+  }
+  .about-link:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .about-val {
+    flex-shrink: 0;
+    font-size: 12.5px;
+    color: var(--text-1);
   }
 </style>
