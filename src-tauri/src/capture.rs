@@ -53,6 +53,7 @@ pub fn start(
     _bitrate: u32,
     _mic: bool,
     _mic_device: String,
+    _encoder_pref: String,
 ) -> Result<(), String> {
     Err("La captura solo está disponible en Windows".into())
 }
@@ -78,6 +79,7 @@ pub fn start_replay(
     _bitrate: u32,
     _mic: bool,
     _mic_device: String,
+    _encoder_pref: String,
 ) -> Result<(), String> {
     Err("El replay solo está disponible en Windows".into())
 }
@@ -232,6 +234,7 @@ mod win {
         bitrate: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: String,
     ) -> std::result::Result<(), String> {
         let mut guard = STATE.lock().unwrap();
         if guard.is_some() {
@@ -252,8 +255,8 @@ mod win {
             .name("flashback-capture".into())
             .spawn(move || {
                 capture_thread(
-                    target, out_dir, fps, factor, resolution, bitrate, mic, mic_device, stop_t,
-                    stats_t, result_t, ready_tx,
+                    target, out_dir, fps, factor, resolution, bitrate, mic, mic_device,
+                    encoder_pref, stop_t, stats_t, result_t, ready_tx,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -320,6 +323,7 @@ mod win {
         bitrate_override: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: String,
         stop: Arc<(Mutex<bool>, Condvar)>,
         stats: Arc<Stats>,
         result: Arc<Mutex<Option<String>>>,
@@ -333,6 +337,7 @@ mod win {
         let mut engine = match resolve_target_item(&target).and_then(|item| {
             build_engine(
                 &stats, item, &out_dir, fps, factor, resolution, bitrate_override, mic, mic_device,
+                &encoder_pref,
             )
             .map_err(|e| format!("{e:?}"))
         }) {
@@ -437,6 +442,7 @@ mod win {
         bitrate_override: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: &str,
     ) -> Result<Engine> {
         let (device, d3d_device) = create_device()?;
         // NV12/H.264 exigen dimensiones PARES (ver nota en build_replay): la ventana de un
@@ -473,7 +479,7 @@ mod win {
         let out_path = format!("{out_dir}\\{}", clip_filename());
         let encoder = Arc::new(Mutex::new(Encoder::new(
             &device, width, height, out_w, out_h, fps, bitrate, out_path, sys_target,
-            mic_target,
+            mic_target, encoder_pref,
         )?));
 
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -633,6 +639,7 @@ mod win {
             path: String,
             sys_audio: Option<(u32, u16)>,
             mic_audio: Option<(u32, u16)>,
+            encoder_pref: &str,
         ) -> Result<Encoder> {
             ensure_mf();
 
@@ -649,13 +656,17 @@ mod win {
                 let _ = unsafe { mt.SetMultithreadProtected(true) };
             }
 
+            let use_hw = encoder_pref != "Software"
+                && std::env::var_os("FLASHBACK_FORCE_SW_ENCODER").is_none();
             let attrs = unsafe {
                 let mut a: Option<IMFAttributes> = None;
                 MFCreateAttributes(&mut a, 3)?;
                 let a = a.unwrap();
-                a.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+                if use_hw {
+                    a.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+                    a.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager)?;
+                }
                 a.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
-                a.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager)?;
                 a
             };
 
@@ -1054,6 +1065,7 @@ mod win {
         bitrate: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: String,
     ) -> std::result::Result<(), String> {
         let mut guard = REPLAY_STATE.lock().unwrap();
         if guard.is_some() {
@@ -1074,8 +1086,8 @@ mod win {
             .name("flashback-replay".into())
             .spawn(move || {
                 replay_thread(
-                    target, seconds, fps, factor, resolution, bitrate, mic, mic_device, stop_t,
-                    buf_t, stats, ready_tx,
+                    target, seconds, fps, factor, resolution, bitrate, mic, mic_device,
+                    encoder_pref, stop_t, buf_t, stats, ready_tx,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -1229,6 +1241,7 @@ mod win {
         bitrate_override: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: String,
         stop: Arc<AtomicBool>,
         buffer: Arc<Mutex<ReplayBuffer>>,
         stats: Arc<Stats>,
@@ -1255,7 +1268,7 @@ mod win {
             let built = resolve_target_item(&target).and_then(|item| {
                 build_replay(
                     &buffer, &stats, item, fps, factor, resolution, bitrate_override, mic,
-                    mic_device.clone(), window_mode,
+                    mic_device.clone(), &encoder_pref, window_mode,
                 )
                 .map_err(|e| format!("{e:?}"))
             });
@@ -1378,6 +1391,7 @@ mod win {
         bitrate_override: u32,
         mic: bool,
         mic_device: String,
+        encoder_pref: &str,
         window_mode: bool,
     ) -> Result<ReplayPipeline> {
         ensure_mf();
@@ -1444,7 +1458,7 @@ mod win {
         // Encoder primero: si no hay H.264 por hardware (o se fuerza), cae a software
         // (MFT síncrono, codifica en CPU). El resto del pipeline se adapta a ese modo.
         // El encoder trabaja ya en la resolución de salida (out_*).
-        let (encoder, enc_events) = build_encoder(&manager, out_w, out_h, fps, bitrate)?;
+        let (encoder, enc_events) = build_encoder(&manager, out_w, out_h, fps, bitrate, encoder_pref)?;
         let software = enc_events.is_none();
 
         // El conversor BGRA→NV12 escala de captura (width/height) a salida (out_*): va en
@@ -1707,17 +1721,20 @@ mod win {
     // software (MFT síncrono, CPU) como fallback. Devuelve el generador de eventos solo
     // en el caso asíncrono; None marca el camino software. FLASHBACK_FORCE_SW_ENCODER
     // fuerza el software para poder validarlo en equipos que sí tienen hardware.
+    // encoder_pref: "Auto"|"NVENC"|"AMF"|"Quick Sync"|"Software"
     fn build_encoder(
         manager: &IMFDXGIDeviceManager,
         width: u32,
         height: u32,
         fps: u32,
         bitrate: u32,
+        encoder_pref: &str,
     ) -> Result<(IMFTransform, Option<IMFMediaEventGenerator>)> {
-        let force_sw = std::env::var_os("FLASHBACK_FORCE_SW_ENCODER").is_some();
+        let force_sw = std::env::var_os("FLASHBACK_FORCE_SW_ENCODER").is_some()
+            || encoder_pref == "Software";
 
         if !force_sw {
-            if let Some(activate) = enum_encoder(MFT_ENUM_FLAG_HARDWARE)? {
+            if let Some(activate) = pick_hw_encoder(encoder_pref)? {
                 let encoder: IMFTransform = unsafe { activate.ActivateObject()? };
                 // Desbloquear el MFT asíncrono y compartir el device (zero-copy GPU).
                 unsafe {
@@ -1739,6 +1756,78 @@ mod win {
         let encoder: IMFTransform = unsafe { activate.ActivateObject()? };
         configure_encoder_types(&encoder, width, height, fps, bitrate)?;
         Ok((encoder, None))
+    }
+
+    // Enumera todos los encoders H.264 por hardware y devuelve el que coincide con la
+    // preferencia de vendor. "Auto" devuelve el primero (MF ya los ordena por calidad).
+    // Si la preferencia no coincide con ningún encoder disponible, devuelve el primero
+    // como fallback en lugar de fallar.
+    fn pick_hw_encoder(pref: &str) -> Result<Option<IMFActivate>> {
+        let info = MFT_REGISTER_TYPE_INFO {
+            guidMajorType: MFMediaType_Video,
+            guidSubtype: MFVideoFormat_H264,
+        };
+        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+        let mut count = 0u32;
+        unsafe {
+            MFTEnumEx(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                None,
+                Some(&info),
+                &mut activates,
+                &mut count,
+            )?;
+        }
+        if count == 0 || activates.is_null() {
+            return Ok(None);
+        }
+
+        let keywords: &[&str] = match pref.to_lowercase().as_str() {
+            "nvenc" => &["nvenc", "nvidia"],
+            "amf" => &["amf", "amd"],
+            "quick sync" => &["quick sync", "intel"],
+            _ => &[],
+        };
+
+        let mut chosen: Option<IMFActivate> = None;
+        for i in 0..count as usize {
+            let act = unsafe { &*activates.add(i) };
+            if let Some(act) = act {
+                if chosen.is_none() {
+                    // Siempre guardamos el primero como fallback.
+                    chosen = Some(act.clone());
+                }
+                if !keywords.is_empty() && encoder_name_matches(act, keywords) {
+                    chosen = Some(act.clone());
+                    break;
+                }
+            }
+        }
+
+        // Liberar el array de activates: drop_in_place decrementa el refcount de cada uno.
+        for i in 0..count as usize {
+            unsafe { std::ptr::drop_in_place(activates.add(i)) };
+        }
+        unsafe { CoTaskMemFree(Some(activates as *const _)) };
+
+        Ok(chosen)
+    }
+
+    fn encoder_name_matches(activate: &IMFActivate, keywords: &[&str]) -> bool {
+        let attrs: IMFAttributes = match activate.cast() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let mut buf = [0u16; 512];
+        let mut len = 0u32;
+        if unsafe { attrs.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, Some(&mut len)) }
+            .is_err()
+        {
+            return false;
+        }
+        let name = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+        keywords.iter().any(|k| name.contains(k))
     }
 
     // Primer encoder H.264 que cumple los flags, o None si no hay ninguno.

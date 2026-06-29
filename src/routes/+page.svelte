@@ -8,6 +8,9 @@
 
   let query = $state('');
   let filters = $state<Filter[]>([]);
+  let sortAsc = $state(false);
+  let sortOpen = $state(false);
+  let sortEl = $state<HTMLElement | null>(null);
 
   $effect(() => {
     refreshLibrary();
@@ -20,7 +23,16 @@
       return matchesQuery && clipMatchesFilters(c, filters);
     })
   );
-  const groups = $derived(groupClips(filtered));
+  const groups = $derived(groupClips(filtered, sortAsc));
+
+  $effect(() => {
+    if (!sortOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (sortEl && !sortEl.contains(e.target as Node)) sortOpen = false;
+    };
+    window.addEventListener('mousedown', onDown, true);
+    return () => window.removeEventListener('mousedown', onDown, true);
+  });
 
   // El editor navega anterior/siguiente por este mismo orden (grupos aplanados).
   $effect(() => {
@@ -32,10 +44,6 @@
   <header class="head">
     <div class="left">
       <h1>Todos los clips</h1>
-      <button class="montage">
-        <Icon name="plus" size={15} sw={2} />
-        Crear montaje
-      </button>
     </div>
 
     <div class="right">
@@ -44,10 +52,22 @@
         <input placeholder="Buscar clips" bind:value={query} />
       </label>
       <LibraryFilter clips={library.clips} bind:selected={filters} />
-      <button class="ctrl">
-        Más reciente
-        <Icon name="chevron-down" size={13} sw={2} />
-      </button>
+      <div class="sort-dd" class:open={sortOpen} bind:this={sortEl}>
+        <button class="ctrl" onclick={() => (sortOpen = !sortOpen)}>
+          {sortAsc ? 'Más antiguo' : 'Más reciente'}
+          <Icon name="chevron-down" size={13} sw={2} />
+        </button>
+        {#if sortOpen}
+          <div class="sort-menu">
+            <button class="sort-item" class:on={!sortAsc} onclick={() => { sortAsc = false; sortOpen = false; }}>
+              Más reciente
+            </button>
+            <button class="sort-item" class:on={sortAsc} onclick={() => { sortAsc = true; sortOpen = false; }}>
+              Más antiguo
+            </button>
+          </div>
+        {/if}
+      </div>
     </div>
   </header>
 
@@ -102,26 +122,7 @@
     font-weight: 650;
     letter-spacing: -0.01em;
   }
-  .montage {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    margin-left: 4px;
-    padding: 8px 14px;
-    font-size: 13px;
-    font-weight: 560;
-    color: var(--bright);
-    background: rgba(240, 242, 247, 0.1);
-    border: 1px solid rgba(240, 242, 247, 0.3);
-    border-radius: var(--r-sm);
-    transition: background 0.15s ease, box-shadow 0.15s ease;
-  }
-  .montage:hover {
-    background: rgba(240, 242, 247, 0.16);
-    box-shadow: 0 0 0 3px rgba(240, 242, 247, 0.08);
-  }
-
-  .right {
+.right {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -170,6 +171,44 @@
   .ctrl:hover {
     color: var(--text-0);
     border-color: var(--line-strong);
+  }
+  .sort-dd {
+    position: relative;
+  }
+  .sort-dd.open .ctrl {
+    border-color: var(--line-strong);
+    color: var(--text-0);
+  }
+  .sort-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    min-width: 150px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 5px;
+    background: var(--bg-1);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    box-shadow: 0 18px 42px -14px rgba(0, 0, 0, 0.7);
+    z-index: 70;
+  }
+  .sort-item {
+    padding: 7px 10px;
+    font-size: 13px;
+    text-align: left;
+    color: var(--text-1);
+    border-radius: 6px;
+    transition: background 0.13s ease, color 0.13s ease;
+  }
+  .sort-item:hover {
+    background: var(--bg-3);
+    color: var(--text-0);
+  }
+  .sort-item.on {
+    color: var(--text-0);
+    font-weight: 560;
   }
   .group {
     margin-bottom: 30px;

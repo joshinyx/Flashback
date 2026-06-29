@@ -1,6 +1,14 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use tauri::Manager;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SeenGame {
+    pub name: String,
+    pub steam_appid: Option<u32>,
+    pub last_seen: u64,
+}
 
 fn settings_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().app_data_dir().ok().map(|d| d.join("settings.json"))
@@ -111,6 +119,69 @@ pub fn library_dirs(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|p| seen.insert(p.to_string_lossy().to_lowercase()));
     dirs
+}
+
+pub fn get_disabled_games(app: &tauri::AppHandle) -> Vec<String> {
+    read_array(app, "disabled_games")
+}
+
+pub fn set_disabled_games(app: &tauri::AppHandle, games: Vec<String>) -> Result<(), String> {
+    write_setting(app, "disabled_games", serde_json::json!(games))
+}
+
+pub fn get_seen_games(app: &tauri::AppHandle) -> Vec<SeenGame> {
+    let Some(path) = settings_path(app) else { return Vec::new() };
+    let Ok(s) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else { return Vec::new() };
+    let mut games: Vec<SeenGame> = v
+        .get("seen_games")
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default();
+    games.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    games
+}
+
+// Registra un juego detectado. Solo escribe en disco si es nuevo o han pasado >60 s,
+// para no generar I/O constante durante una sesión de juego.
+pub fn record_seen_game(app: &tauri::AppHandle, name: &str, steam_appid: Option<u32>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let Some(path) = settings_path(app) else { return };
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        let _ = write_setting(app, "seen_games", serde_json::json!([{
+            "name": name, "steam_appid": steam_appid, "last_seen": now
+        }]));
+        return;
+    };
+    let mut v: serde_json::Value = serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}));
+    let arr = v.get_mut("seen_games").and_then(|a| a.as_array_mut());
+
+    if let Some(arr) = arr {
+        if let Some(entry) = arr.iter_mut().find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name)) {
+            let stale = entry.get("last_seen").and_then(|t| t.as_u64())
+                .map(|t| now.saturating_sub(t) >= 60)
+                .unwrap_or(true);
+            if !stale { return; }
+            *entry = serde_json::json!({ "name": name, "steam_appid": steam_appid, "last_seen": now });
+        } else {
+            arr.push(serde_json::json!({ "name": name, "steam_appid": steam_appid, "last_seen": now }));
+        }
+    } else {
+        v["seen_games"] = serde_json::json!([{ "name": name, "steam_appid": steam_appid, "last_seen": now }]);
+    }
+
+    let _ = std::fs::write(&path, v.to_string());
+}
+
+pub fn get_encoder(app: &tauri::AppHandle) -> String {
+    read_setting(app, "encoder").unwrap_or_else(|| "Auto".into())
+}
+
+pub fn set_encoder(app: &tauri::AppHandle, enc: &str) -> Result<(), String> {
+    write_setting(app, "encoder", serde_json::json!(enc))
 }
 
 pub fn set_clips_dir(app: &tauri::AppHandle, dir: &str) -> Result<(), String> {

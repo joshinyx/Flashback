@@ -109,14 +109,19 @@ pub async fn game_hero(
 }
 
 async fn steam_hero(client: &reqwest::Client, app: &tauri::AppHandle, appid: u32) -> Option<Vec<u8>> {
-    // Arte oficial directo del CDN de Steam (exacto por AppID, sin API key).
-    let url =
-        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_hero.jpg");
-    if let Ok(resp) = client.get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(bytes) = resp.bytes().await {
-                if !bytes.is_empty() {
-                    return Some(bytes.to_vec());
+    // header.jpg primero: el capsule clásico tiene siempre el logo/nombre del juego
+    // visible y es mucho más reconocible que el library_hero artístico.
+    let candidates = [
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"),
+        format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_hero.jpg"),
+    ];
+    for url in &candidates {
+        if let Ok(resp) = client.get(url).send().await {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes().await {
+                    if !bytes.is_empty() {
+                        return Some(bytes.to_vec());
+                    }
                 }
             }
         }
@@ -182,4 +187,68 @@ async fn first_hero(client: &reqwest::Client, key: &str, game_id: u32) -> Option
     }
     let parsed: HeroResp = resp.json().await.ok()?;
     parsed.data.into_iter().next().map(|a| a.url)
+}
+
+async fn first_icon(client: &reqwest::Client, key: &str, game_id: u32) -> Option<String> {
+    let url = format!("{API_BASE}/icons/game/{game_id}");
+    let resp = client.get(url).bearer_auth(key).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: HeroResp = resp.json().await.ok()?;
+    parsed.data.into_iter().next().map(|a| a.url)
+}
+
+pub async fn game_icon(
+    app: &tauri::AppHandle,
+    name: &str,
+    steam_appid: Option<u32>,
+) -> Option<String> {
+    let dir = app.path().app_cache_dir().ok()?.join("artwork");
+    let _ = std::fs::create_dir_all(&dir);
+    let cache_key = match steam_appid {
+        Some(id) => format!("icon-steam-{id}"),
+        None => format!("icon-{}", slug(name)),
+    };
+    let path = dir.join(&cache_key);
+
+    if let Ok(bytes) = std::fs::read(&path) {
+        if !bytes.is_empty() {
+            return Some(to_data_url(&bytes));
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let bytes = match steam_appid {
+        Some(id) => steam_icon(&client, app, id).await?,
+        None => name_icon(&client, app, name).await?,
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    let _ = std::fs::write(&path, &bytes);
+    Some(to_data_url(&bytes))
+}
+
+async fn steam_icon(client: &reqwest::Client, app: &tauri::AppHandle, appid: u32) -> Option<Vec<u8>> {
+    // SteamGridDB primero si hay API key: iconos cuadrados reales.
+    if let Some(key) = api_key(app) {
+        if let Some(game_id) = sgdb_by_steam(client, &key, appid).await {
+            if let Some(icon_url) = first_icon(client, &key, game_id).await {
+                if let Some(bytes) = download(client, &icon_url).await {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    // Fallback sin API key: portada vertical del CDN de Steam (600×900), se recorta a cuadrado en CSS.
+    let cdn_url = format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/library_600x900.jpg");
+    download(client, &cdn_url).await
+}
+
+async fn name_icon(client: &reqwest::Client, app: &tauri::AppHandle, name: &str) -> Option<Vec<u8>> {
+    let key = api_key(app)?;
+    let game_id = search_game(client, &key, name).await?;
+    let icon_url = first_icon(client, &key, game_id).await?;
+    download(client, &icon_url).await
 }

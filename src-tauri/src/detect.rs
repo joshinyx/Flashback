@@ -157,7 +157,9 @@ async fn ensure_map(app: &tauri::AppHandle) -> Option<Arc<GameMap>> {
 
 pub async fn detect_game(app: &tauri::AppHandle) -> Option<DetectedGame> {
     let map = ensure_map(app).await?;
-    detect_with(&map)
+    let game = detect_with(&map)?;
+    crate::config::record_seen_game(app, &game.name, game.steam_appid);
+    Some(game)
 }
 
 // PID del juego actualmente rastreado (el de primer plano, persistido mientras viva).
@@ -398,3 +400,4 @@ fn running_processes() -> Vec<(u32, String)> {
     }
     out
 }
+

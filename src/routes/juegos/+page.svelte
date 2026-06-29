@@ -1,103 +1,157 @@
 <script lang="ts">
-  // Datos de ejemplo: aún no hay backend de lista de juegos (detect_game solo devuelve
-  // el juego activo). Pendiente: detección del sistema o DB local de juegos registrados.
-  let capturing = $state({
-    name: 'Minecraft',
-    initials: 'MC',
-    note: 'Capturando tus mejores jugadas.. ¿o no?',
-    on: true
+  import { invoke } from '@tauri-apps/api/core';
+  import Icon from '$lib/components/Icon.svelte';
+  import { type SeenGame, gameSettings, loadDisabledGames, toggleGameDisabled, fetchSeenGames } from '$lib/games.svelte';
+
+  type Detected = { name: string; steam_appid: number | null };
+
+  let seenGames = $state<SeenGame[]>([]);
+  let currentGame = $state<Detected | null>(null);
+  let logos = $state<Record<string, string | null>>({});
+
+  function initials(name: string): string {
+    const parts = name.replace(/[^a-zA-Z0-9 ]/g, '').split(/\s+/).filter(Boolean);
+    return parts.slice(0, 2).map((w) => w[0]).join('').toUpperCase() || '?';
+  }
+
+  function lastSeenLabel(ts: number): string {
+    const diff = Math.floor(Date.now() / 1000 - ts);
+    if (diff < 60) return 'Hace un momento';
+    if (diff < 3600) return `Hace ${Math.floor(diff / 60)} min`;
+    if (diff < 86400) return `Hace ${Math.floor(diff / 3600)} h`;
+    const days = Math.floor(diff / 86400);
+    if (days === 1) return 'Ayer';
+    if (days < 7) return `Hace ${days} días`;
+    if (days < 30) return `Hace ${Math.floor(days / 7)} semana${Math.floor(days / 7) > 1 ? 's' : ''}`;
+    if (days < 365) return `Hace ${Math.floor(days / 30)} mes${Math.floor(days / 30) > 1 ? 'es' : ''}`;
+    return `Hace ${Math.floor(days / 365)} año${Math.floor(days / 365) > 1 ? 's' : ''}`;
+  }
+
+  function logoKey(name: string, steam_appid: number | null): string {
+    return steam_appid ? `steam:${steam_appid}` : `name:${name}`;
+  }
+
+  async function ensureLogo(name: string, steam_appid: number | null) {
+    const key = logoKey(name, steam_appid);
+    if (key in logos) return;
+    logos[key] = null;
+    try {
+      const url = await invoke<string | null>('game_icon', { name, steamAppid: steam_appid });
+      logos = { ...logos, [key]: url ?? null };
+    } catch {}
+  }
+
+  $effect(() => {
+    loadDisabledGames();
+    (async () => {
+      const [seen, detected] = await Promise.all([
+        fetchSeenGames(),
+        invoke<Detected | null>('detect_game').catch(() => null)
+      ]);
+      seenGames = seen;
+      currentGame = detected;
+      for (const g of seen) ensureLogo(g.name, g.steam_appid);
+      if (detected) ensureLogo(detected.name, detected.steam_appid);
+    })();
   });
 
-  let detected = $state([
-    {
-      name: 'Counter-Strike 2',
-      initials: 'CS',
-      lastSeen: 'Última vez hace 18 horas',
-      exe: 'C:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\game\\bin\\win64\\cs2.exe',
-      on: true
-    },
-    {
-      name: 'League of Legends',
-      initials: 'LoL',
-      lastSeen: 'Última vez hace 2 días',
-      exe: 'C:\\Riot Games\\League of Legends\\Game\\League of Legends.exe',
-      on: false
-    }
-  ]);
+  const otherGames = $derived(
+    currentGame
+      ? seenGames.filter((g) => g.name !== currentGame!.name)
+      : seenGames
+  );
 </script>
 
 <div class="games">
   <header class="head">
-    <div class="left">
-      <h1>Juegos detectados</h1>
-    </div>
-    <div class="right">
-      <span class="add-game-prompt">¿No ves tu juego? <button class="add-game-link">¡Añádelo!</button></span>
-    </div>
+    <h1>Juegos detectados</h1>
   </header>
 
-  <section class="game-group">
-    <div class="game-group-head">
-      <span class="label">Capturando</span>
-      <span class="dash"></span>
-    </div>
-    <div class="game-list">
-      <div class="game-row running">
-        <span class="game-ico mono">{capturing.initials}</span>
-        <div class="game-info">
-          <span class="game-name">{capturing.name}</span>
-          <span class="game-path mono">{capturing.note}</span>
-        </div>
-        <div class="cap-toggle">
-          <span class="cap-toggle-label">Capturar</span>
-          <button
-            class="switch"
-            class:on={capturing.on}
-            onclick={() => (capturing.on = !capturing.on)}
-            role="switch"
-            aria-checked={capturing.on}
-            aria-label={`Capturar ${capturing.name}`}
-          >
-            <span class="knob"></span>
-          </button>
-        </div>
+  {#if currentGame}
+    <section class="game-group">
+      <div class="game-group-head">
+        <span class="label">Ahora mismo</span>
+        <span class="dash"></span>
       </div>
-    </div>
-  </section>
-
-  <section class="game-group">
-    <div class="game-group-head">
-      <span class="label">Detectados en el sistema</span>
-      <span class="dash"></span>
-    </div>
-    <div class="game-list">
-      {#each detected as g (g.name)}
-        <div class="game-row">
-          <span class="game-ico mono">{g.initials}</span>
+      <div class="game-list">
+        <div class="game-row running" class:cap-off={gameSettings.isDisabled(currentGame.name)}>
+          <span class="game-ico mono">
+            {#if logos[logoKey(currentGame.name, currentGame.steam_appid)]}
+              <img src={logos[logoKey(currentGame.name, currentGame.steam_appid)]} alt={currentGame.name} />
+            {:else}
+              {initials(currentGame.name)}
+            {/if}
+          </span>
           <div class="game-info">
-            <span class="game-name">{g.name}</span>
-            <span class="game-sub">
-              <span class="game-path mono sub-lastseen">{g.lastSeen}</span>
-              <span class="game-path mono sub-exe">{g.exe}</span>
-            </span>
+            <span class="game-name">{currentGame.name}</span>
+            <span class="game-path">{gameSettings.isDisabled(currentGame.name) ? 'Captura deshabilitada' : 'Capturando clips'}</span>
           </div>
           <div class="cap-toggle">
             <span class="cap-toggle-label">Capturar</span>
             <button
               class="switch"
-              class:on={g.on}
-              onclick={() => (g.on = !g.on)}
+              class:on={!gameSettings.isDisabled(currentGame.name)}
+              onclick={() => toggleGameDisabled(currentGame!.name)}
               role="switch"
-              aria-checked={g.on}
-              aria-label={`Capturar ${g.name}`}
+              aria-checked={!gameSettings.isDisabled(currentGame.name)}
+              aria-label={`Capturar ${currentGame.name}`}
             >
               <span class="knob"></span>
             </button>
           </div>
         </div>
-      {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if otherGames.length > 0}
+    <section class="game-group">
+      <div class="game-group-head">
+        <span class="label">Juegos Recientes</span>
+        <span class="dash"></span>
+      </div>
+      <div class="game-list">
+        {#each otherGames as g (g.name)}
+          {@const key = logoKey(g.name, g.steam_appid)}
+          {@const logo = logos[key] ?? null}
+          {@const disabled = gameSettings.isDisabled(g.name)}
+          <div class="game-row" class:cap-off={disabled}>
+            <span class="game-ico mono">
+              {#if logo}<img src={logo} alt={g.name} />{:else}{initials(g.name)}{/if}
+            </span>
+            <div class="game-info">
+              <span class="game-name">{g.name}</span>
+              <span class="game-sub">
+                <span class="game-path sub-primary">{lastSeenLabel(g.last_seen)}</span>
+                <span class="game-path mono sub-secondary">{disabled ? 'Captura deshabilitada' : 'Captura activa'}</span>
+              </span>
+            </div>
+            <div class="cap-toggle">
+              <span class="cap-toggle-label">Capturar</span>
+              <button
+                class="switch"
+                class:on={!disabled}
+                onclick={() => toggleGameDisabled(g.name)}
+                role="switch"
+                aria-checked={!disabled}
+                aria-label={`Capturar ${g.name}`}
+              >
+                <span class="knob"></span>
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
+
+  {#if !currentGame && otherGames.length === 0}
+    <div class="empty">
+      <Icon name="gamepad" size={46} sw={1.3} />
+      <p>Aún no has abierto ningún juego con Flashback activo.</p>
+      <span class="hint mono">Los juegos aparecen aquí la primera vez que los detectamos.</span>
     </div>
-  </section>
+  {/if}
 </div>
 
 <style>
@@ -106,38 +160,12 @@
   }
 
   .head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 18px;
     margin-bottom: 26px;
-    flex-wrap: wrap;
-  }
-  .left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
   }
   h1 {
     font-size: 22px;
     font-weight: 650;
     letter-spacing: -0.01em;
-  }
-  .add-game-prompt {
-    font-size: 13px;
-    color: var(--text-2);
-  }
-  .add-game-link {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--accent-soft);
-    padding: 0;
-    transition: color 0.15s ease;
-  }
-  .add-game-link:hover {
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 3px;
   }
 
   .game-group {
@@ -168,7 +196,7 @@
     background: var(--bg-1);
     border: 1px solid var(--line);
     border-radius: var(--r-md);
-    transition: border-color 0.15s ease, background 0.15s ease;
+    transition: border-color 0.15s ease, opacity 0.15s ease;
   }
   .game-row:hover {
     border-color: var(--line-strong);
@@ -176,6 +204,10 @@
   .game-row.running {
     background: var(--bg-2);
   }
+  .game-row.cap-off {
+    opacity: 0.55;
+  }
+
   .game-ico {
     display: grid;
     place-items: center;
@@ -185,13 +217,15 @@
     font-size: 14px;
     font-weight: 600;
     letter-spacing: 0.02em;
-    color: var(--text-1);
-    background: var(--bg-3);
-    border: 1px solid var(--line);
+    color: var(--text-2);
     border-radius: 10px;
+    overflow: hidden;
   }
-  .game-row.running .game-ico {
-    color: var(--text-0);
+  .game-ico img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 10px;
   }
   .game-info {
     flex: 1;
@@ -215,7 +249,6 @@
     text-overflow: ellipsis;
   }
 
-  /* Cross-fade: "última vez" sube y se desvanece; la ruta entra desde abajo al hacer hover. */
   .game-sub {
     position: relative;
     display: block;
@@ -227,29 +260,14 @@
     left: 0;
     top: 0;
     width: 100%;
-    transition: transform 0.34s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.28s ease;
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
   }
-  .game-sub .sub-lastseen {
-    transform: translateY(0);
-    opacity: 1;
-  }
-  .game-sub .sub-exe {
-    transform: translateY(105%);
-    opacity: 0;
-    color: var(--text-2);
-  }
-  .game-row:hover .game-sub .sub-lastseen {
-    transform: translateY(-105%);
-    opacity: 0;
-  }
-  .game-row:hover .game-sub .sub-exe {
-    transform: translateY(0);
-    opacity: 1;
-  }
+  .sub-primary { transform: translateY(0); opacity: 1; }
+  .sub-secondary { transform: translateY(105%); opacity: 0; color: var(--text-2); }
+  .game-row:hover .sub-primary { transform: translateY(-105%); opacity: 0; }
+  .game-row:hover .sub-secondary { transform: translateY(0); opacity: 1; }
   @media (prefers-reduced-motion: reduce) {
-    .game-sub .game-path {
-      transition: none;
-    }
+    .game-sub .game-path { transition: none; }
   }
 
   .cap-toggle {
@@ -293,5 +311,23 @@
   .switch.on .knob {
     transform: translateX(19px);
     background: var(--bg-1);
+  }
+
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 90px 0;
+    color: var(--text-3);
+  }
+  .empty p {
+    font-size: 14px;
+    color: var(--text-2);
+    text-align: center;
+  }
+  .empty .hint {
+    font-size: 11.5px;
+    color: var(--text-3);
   }
 </style>

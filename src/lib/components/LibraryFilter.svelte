@@ -39,13 +39,11 @@
   let logos = $state<Record<string, string | null>>({});
   async function ensureLogo(name: string) {
     if (name in logos) return;
-    logos[name] = null; // marca en curso para no duplicar la petición
+    logos[name] = null;
     try {
-      const url = await invoke<string | null>('game_hero', { name, steamAppid: null });
+      const url = await invoke<string | null>('game_icon', { name, steamAppid: null });
       logos = { ...logos, [name]: url ?? null };
-    } catch {
-      // sin red / fuera de Tauri: se queda con la inicial
-    }
+    } catch {}
   }
   $effect(() => {
     if (open) for (const g of games) ensureLogo(g);

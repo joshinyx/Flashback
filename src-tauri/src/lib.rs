@@ -21,8 +21,32 @@ async fn game_hero(
 }
 
 #[tauri::command]
+async fn game_icon(
+    app: tauri::AppHandle,
+    name: String,
+    steam_appid: Option<u32>,
+) -> Option<String> {
+    artwork::game_icon(&app, &name, steam_appid).await
+}
+
+#[tauri::command]
 async fn detect_game(app: tauri::AppHandle) -> Option<detect::DetectedGame> {
     detect::detect_game(&app).await
+}
+
+#[tauri::command]
+fn get_seen_games(app: tauri::AppHandle) -> Vec<config::SeenGame> {
+    config::get_seen_games(&app)
+}
+
+#[tauri::command]
+fn get_disabled_games(app: tauri::AppHandle) -> Vec<String> {
+    config::get_disabled_games(&app)
+}
+
+#[tauri::command]
+fn set_disabled_games(app: tauri::AppHandle, games: Vec<String>) -> Result<(), String> {
+    config::set_disabled_games(&app, games)
 }
 
 #[tauri::command]
@@ -33,6 +57,16 @@ fn list_monitors() -> Vec<capture::MonitorInfo> {
 #[tauri::command]
 fn list_audio_inputs() -> Vec<capture::AudioInput> {
     capture::list_audio_inputs()
+}
+
+#[tauri::command]
+fn get_encoder(app: tauri::AppHandle) -> String {
+    config::get_encoder(&app)
+}
+
+#[tauri::command]
+fn set_encoder(app: tauri::AppHandle, enc: String) -> Result<(), String> {
+    config::set_encoder(&app, &enc)
 }
 
 #[tauri::command]
@@ -47,6 +81,7 @@ fn start_capture(
     mic_device: String,
 ) -> Result<(), String> {
     let dir = config::clips_dir(&app).to_string_lossy().into_owned();
+    let encoder_pref = config::get_encoder(&app);
     capture::start(
         target,
         dir,
@@ -56,6 +91,7 @@ fn start_capture(
         bitrate,
         mic,
         mic_device,
+        encoder_pref,
     )
 }
 
@@ -82,6 +118,7 @@ fn start_replay(
     mic_device: String,
 ) -> Result<(), String> {
     let dir = config::clips_dir(&app).to_string_lossy().into_owned();
+    let encoder_pref = config::get_encoder(&app);
     capture::start_replay(
         target,
         dir,
@@ -92,6 +129,7 @@ fn start_replay(
         bitrate,
         mic,
         mic_device,
+        encoder_pref,
     )
 }
 
@@ -397,7 +435,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             game_hero,
+            game_icon,
             detect_game,
+            get_seen_games,
+            get_disabled_games,
+            set_disabled_games,
+            get_encoder,
+            set_encoder,
             list_monitors,
             list_audio_inputs,
             start_capture,

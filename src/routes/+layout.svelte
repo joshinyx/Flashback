@@ -27,6 +27,7 @@
     RES_OPTIONS,
     type QualityKey
   } from '$lib/capture-config.svelte';
+  import { gameSettings, loadDisabledGames } from '$lib/games.svelte';
 
   let { children } = $props();
 
@@ -300,10 +301,12 @@
   let frame = $state('');
   let frameKey = '';
 
+  const gameDisabled = $derived(!!game && gameSettings.isDisabled(game));
+
   // Objetivo de captura: una pantalla concreta, o la ventana del juego detectado en
-  // modo Aplicación. Si es modo Aplicación y NO hay juego, no hay objetivo (null): el
-  // usuario debe elegir una pantalla; no se cae al fallback de grabar la principal.
-  const captureTarget = $derived(selectedMonitor ? selectedMonitor : game ? 'window' : null);
+  // modo Aplicación. Si es modo Aplicación y NO hay juego (o está deshabilitado), no hay
+  // objetivo (null): el usuario debe elegir una pantalla.
+  const captureTarget = $derived(selectedMonitor ? selectedMonitor : (game && !gameDisabled) ? 'window' : null);
 
   async function refresh() {
     try {
@@ -334,6 +337,7 @@
     refresh();
     loadMonitors();
     loadAudioInputs();
+    loadDisabledGames();
     const id = setInterval(refresh, 5000);
     return () => {
       clearInterval(id);
@@ -485,6 +489,8 @@
               <span class="cap-label">
                 {#if selectedMonitor}
                   {recording ? 'Grabando pantalla' : 'Pantalla lista'}
+                {:else if game && gameDisabled}
+                  Captura deshabilitada
                 {:else}
                   {game ? 'Capturando clips' : 'En espera'}
                 {/if}

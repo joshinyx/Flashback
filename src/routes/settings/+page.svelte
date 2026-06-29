@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import Icon from '$lib/components/Icon.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
   import { refreshLibrary } from '$lib/library.svelte';
   import {
     hotkeys,
@@ -18,9 +19,7 @@
     replaySound,
     setReplaySoundLevel,
     playReplaySound,
-    soundLabel,
-    SOUND_OPTIONS,
-    type SoundLevel
+    SOUND_OPTIONS
   } from '$lib/replay-sound.svelte';
   import {
     captureConfig,
@@ -32,14 +31,32 @@
     RES_OPTIONS
   } from '$lib/capture-config.svelte';
 
-  let encoder = $state('Automático');
+  const ENCODER_OPTIONS = ['Auto', 'NVENC', 'AMF', 'Quick Sync', 'Software'] as const;
+  type EncoderOption = typeof ENCODER_OPTIONS[number];
+
+  const resOptions = RES_OPTIONS.map((o) => ({ label: o.label, value: o.height }));
+  const fpsOptions = FPS_OPTIONS.map((o) => ({ label: `${o} fps`, value: o }));
+  const qualityOptions = QUALITY_OPTIONS.map((o) => ({ label: o.label, value: o.key }));
+  const encoderOptions = ENCODER_OPTIONS.map((o) => ({ label: o, value: o }));
+  const bufferOptions = BUFFER_OPTIONS.map((o) => ({ label: o.label, value: o.seconds }));
+  const soundOptions = SOUND_OPTIONS.map((o) => ({ label: o.label, value: o.key }));
+
+  let encoder = $state<EncoderOption>('Auto');
   let autoDelete = $state(true);
 
   let folder = $state('');
   let changingFolder = $state(false);
   $effect(() => {
     invoke<string>('clips_dir').then((d) => (folder = d)).catch(() => {});
+    invoke<string>('get_encoder').then((e) => {
+      if (ENCODER_OPTIONS.includes(e as EncoderOption)) encoder = e as EncoderOption;
+    }).catch(() => {});
   });
+
+  function setEncoder(opt: EncoderOption) {
+    encoder = opt;
+    invoke('set_encoder', { enc: opt }).catch(() => {});
+  }
 
   async function changeFolder() {
     if (changingFolder) return;
@@ -69,23 +86,6 @@
   let liveTokens = $state<string[]>([]);
   let badKey = $state(false);
   let canSave = $derived(liveTokens.length > 0 && hasMainKey(liveTokens));
-
-  let soundDDOpen = $state(false);
-  let soundDDEl = $state<HTMLElement | null>(null);
-
-  function pickSound(level: SoundLevel) {
-    setReplaySoundLevel(level);
-    soundDDOpen = false;
-  }
-
-  $effect(() => {
-    if (!soundDDOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (soundDDEl && !soundDDEl.contains(e.target as Node)) soundDDOpen = false;
-    };
-    window.addEventListener('mousedown', onDown, true);
-    return () => window.removeEventListener('mousedown', onDown, true);
-  });
 
   function onKeyDown(e: KeyboardEvent) {
     if (!rebinding) return;
@@ -148,49 +148,18 @@
         <h3>Resolución</h3>
         <p>Alto de salida. Se escala desde la captura nativa, sin superarla.</p>
       </div>
-      <div class="seg">
-        {#each RES_OPTIONS as o (o.height)}
-          <button class:on={captureConfig.resolution === o.height} onclick={() => setResolution(o.height)}>{o.label}</button>
-        {/each}
-      </div>
+      <Dropdown value={captureConfig.resolution} options={resOptions} onchange={setResolution} ariaLabel="Resolución" />
     </div>
 
     <div class="setting">
-      <div class="info"><h3>Frecuencia</h3><p>Fotogramas por segundo del clip.</p></div>
-      <div class="seg">
-        {#each FPS_OPTIONS as o (o)}
-          <button class:on={captureConfig.fps === o} onclick={() => setFps(o)}>{o}</button>
-        {/each}
-      </div>
+      <div class="info"><h3>Fotogramas por segundo</h3><p>Cantidad de fotogramas grabados por segundo.</p></div>
+      <Dropdown value={captureConfig.fps} options={fpsOptions} onchange={setFps} ariaLabel="Fotogramas por segundo" />
     </div>
 
     <div class="setting">
-      <div class="info"><h3>Calidad</h3><p>Más calidad = archivos más pesados.</p></div>
-      <div class="seg">
-        {#each QUALITY_OPTIONS as o (o.key)}
-          <button class:on={captureConfig.quality === o.key} onclick={() => setQuality(o.key)}>{o.label}</button>
-        {/each}
-      </div>
+      <div class="info"><h3>Calidad</h3><p>Más calidad produce archivos más pesados.</p></div>
+      <Dropdown value={captureConfig.quality} options={qualityOptions} onchange={setQuality} ariaLabel="Calidad" />
     </div>
-  </section>
-
-  <section class="panel">
-    <span class="label panel-title">Codificación</span>
-    <div class="setting">
-      <div class="info">
-        <h3>Encoder</h3>
-        <p>Automático elige el mejor por hardware disponible. <span class="hw mono">NVENC detectado</span></p>
-      </div>
-      <div class="seg">
-        {#each ['Automático', 'NVENC', 'AMF', 'Quick Sync', 'Software'] as o (o)}
-          <button class:on={encoder === o} onclick={() => (encoder = o)}>{o}</button>
-        {/each}
-      </div>
-    </div>
-  </section>
-
-  <section class="panel">
-    <span class="label panel-title">Instant Replay</span>
 
     <div class="setting">
       <div class="info"><h3>Replay en segundo plano</h3><p>Mantén un buffer listo para guardar.</p></div>
@@ -201,13 +170,19 @@
 
     <div class="setting" class:disabled={!replay.enabled}>
       <div class="info"><h3>Duración del buffer</h3><p>Cuántos segundos/minutos se guardan al pulsar el atajo.</p></div>
-      <div class="seg">
-        {#each BUFFER_OPTIONS as o (o.seconds)}
-          <button class:on={replay.seconds === o.seconds} onclick={() => setReplaySeconds(o.seconds)}>{o.label}</button>
-        {/each}
-      </div>
+      <Dropdown value={replay.seconds} options={bufferOptions} onchange={setReplaySeconds} ariaLabel="Duración del buffer" />
     </div>
+  </section>
 
+  <section class="panel">
+    <span class="label panel-title">Codificación</span>
+    <div class="setting">
+      <div class="info">
+        <h3>Encoder</h3>
+        <p>Auto elige el mejor encoder por hardware disponible. Software usa CPU.</p>
+      </div>
+      <Dropdown value={encoder} options={encoderOptions} onchange={setEncoder} ariaLabel="Encoder" />
+    </div>
   </section>
 
   <section class="panel">
@@ -215,34 +190,7 @@
     <div class="setting">
       <div class="info"><h3>Sonido al guardar</h3><p>Se reproduce un aviso al guardar un replay.</p></div>
       <div class="sound-row">
-        <div class="dd" class:open={soundDDOpen} bind:this={soundDDEl}>
-          <button
-            class="dd-trigger"
-            aria-haspopup="listbox"
-            aria-expanded={soundDDOpen}
-            aria-label="Volumen del sonido"
-            onclick={() => (soundDDOpen = !soundDDOpen)}
-          >
-            <span class="dd-value">{soundLabel(replaySound.level)}</span>
-            <span class="dd-chev"><Icon name="chevron-down" size={13} sw={2} /></span>
-          </button>
-          {#if soundDDOpen}
-            <div class="dd-list" role="listbox">
-              {#each SOUND_OPTIONS as o (o.key)}
-                <button
-                  class="dd-item"
-                  class:on={replaySound.level === o.key}
-                  role="option"
-                  aria-selected={replaySound.level === o.key}
-                  onclick={() => pickSound(o.key)}
-                >
-                  {o.label}
-                  <span class="dd-check"><Icon name="check" size={13} sw={2.2} /></span>
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
+        <Dropdown value={replaySound.level} options={soundOptions} onchange={setReplaySoundLevel} ariaLabel="Volumen del sonido" />
         <button class="play-btn" aria-label="Probar sonido" onclick={() => playReplaySound()}>
           <Icon name="play" size={18} />
         </button>
@@ -362,37 +310,6 @@
   .path {
     font-size: 11.5px;
     color: var(--text-1);
-  }
-  .hw {
-    color: var(--accent);
-    font-size: 11px;
-    margin-left: 4px;
-  }
-
-  .seg {
-    display: flex;
-    flex-shrink: 0;
-    padding: 3px;
-    gap: 2px;
-    background: var(--bg-0);
-    border: 1px solid var(--line);
-    border-radius: var(--r-sm);
-  }
-  .seg button {
-    padding: 7px 13px;
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-2);
-    border-radius: 5px;
-    transition: color 0.14s ease, background 0.14s ease;
-  }
-  .seg button:hover {
-    color: var(--text-0);
-  }
-  .seg button.on {
-    color: var(--on-accent);
-    background: var(--accent);
-    font-weight: 600;
   }
 
   .switch {
@@ -517,81 +434,6 @@
     gap: 10px;
     flex-shrink: 0;
   }
-  .dd {
-    position: relative;
-    width: 132px;
-  }
-  .dd-trigger {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    height: 34px;
-    padding: 0 12px;
-    font-size: 13px;
-    color: var(--text-1);
-    background: var(--bg-2);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  }
-  .dd-trigger:hover {
-    background: var(--bg-3);
-    color: var(--text-0);
-  }
-  .dd.open .dd-trigger {
-    border-color: var(--accent);
-  }
-  .dd-chev {
-    display: inline-flex;
-    color: var(--text-2);
-    transition: transform 0.18s ease;
-  }
-  .dd.open .dd-chev {
-    transform: rotate(180deg);
-  }
-  .dd-list {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    right: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    padding: 5px;
-    background: var(--bg-1);
-    border: 1px solid var(--line-strong);
-    border-radius: var(--r-sm);
-    box-shadow: 0 18px 42px -14px rgba(0, 0, 0, 0.7);
-    z-index: 70;
-  }
-  .dd-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 8px 10px;
-    font-size: 13px;
-    color: var(--text-1);
-    border-radius: 6px;
-    transition: background 0.13s ease, color 0.13s ease;
-  }
-  .dd-item:hover {
-    background: var(--bg-3);
-    color: var(--text-0);
-  }
-  .dd-item.on {
-    color: var(--text-0);
-  }
-  .dd-check {
-    opacity: 0;
-    flex-shrink: 0;
-    color: var(--accent);
-  }
-  .dd-item.on .dd-check {
-    opacity: 1;
-  }
-
   .play-btn {
     display: inline-flex;
     align-items: center;

@@ -85,8 +85,12 @@ export function clipMatchesFilters(clip: Clip, selected: LibraryFilter[]): boole
 
 export type ClipGroup = { label: string; source: string; clips: Clip[] };
 
-export function groupClips(list: Clip[]): ClipGroup[] {
-  const sorted = [...list].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+export function groupClips(list: Clip[], sortAsc = false): ClipGroup[] {
+  const sorted = [...list].sort((a, b) =>
+    sortAsc
+      ? a.createdAt.getTime() - b.createdAt.getTime()
+      : b.createdAt.getTime() - a.createdAt.getTime()
+  );
   const groups: ClipGroup[] = [];
   for (const clip of sorted) {
     const label = dayLabel(clip.createdAt);
