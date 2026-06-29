@@ -509,6 +509,7 @@ mod win {
         let last_kept = Arc::new(AtomicI64::new(i64::MIN));
         let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
             move |pool, _| {
+                ensure_handler_priority();
                 if let Some(pool) = pool.as_ref() {
                     if let Ok(frame) = pool.TryGetNextFrame() {
                         if let Ok(s) = frame.ContentSize() {
@@ -1540,6 +1541,7 @@ mod win {
         let size_changed_h = size_changed.clone();
         let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
             move |pool, _| {
+                ensure_handler_priority();
                 if let Some(pool) = pool.as_ref() {
                     if let Ok(frame) = pool.TryGetNextFrame() {
                         if let Ok(s) = frame.ContentSize() {
@@ -3062,6 +3064,28 @@ mod win {
         fn drop(&mut self) {
             let _ = unsafe { AvRevertMmThreadCharacteristics(self.0) };
         }
+    }
+
+    // El callback FrameArrived de WGC corre en hilos del threadpool del sistema (prioridad
+    // normal) y hace CopyResource sobre el contexto D3D11 compartido (multihilo-protegido). Si
+    // el juego lo preempta con ese lock tomado, bloquea al pump aunque este ya sea de alta
+    // prioridad: una inversión de prioridad que dejaba algún freeze residual de ~1 s. Elevamos
+    // también ese hilo a MMCSS, una sola vez por hilo del pool (se reutilizan), vía thread-local:
+    // registrar en cada frame sería caro y se revierte solo al morir el hilo. El bool evita
+    // reintentar en cada callback si avrt fallara.
+    thread_local! {
+        static HANDLER_MMCSS: std::cell::RefCell<(bool, Option<MmcssTask>)> =
+            const { std::cell::RefCell::new((false, None)) };
+    }
+
+    fn ensure_handler_priority() {
+        HANDLER_MMCSS.with(|cell| {
+            let mut s = cell.borrow_mut();
+            if !s.0 {
+                s.0 = true;
+                s.1 = MmcssTask::new("Capture");
+            }
+        });
     }
 
     // Decide si conservar un frame con timestamp `t`. `next` guarda el próximo instante
